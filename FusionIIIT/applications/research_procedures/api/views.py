@@ -1,790 +1,743 @@
-from rest_framework.viewsets import ModelViewSet
-from applications.research_procedures.models import *
-from .serializers import *
-from rest_framework.decorators import api_view
-from rest_framework.permissions import IsAuthenticatedOrReadOnly 
-from django.shortcuts import redirect, render, get_object_or_404
+"""
+Django REST Framework Views for RSPC Module API
+Thin views layer - delegates business logic to services and selectors
+"""
+
+from rest_framework import viewsets, status, filters
+from rest_framework.decorators import action
 from rest_framework.response import Response
-from django.http import JsonResponse
-from django.contrib import messages
-from applications.research_procedures.models import *
-from applications.globals.models import ExtraInfo, HoldsDesignation, Designation
-from django.core.files.storage import FileSystemStorage
-from django.core.exceptions import ObjectDoesNotExist
-from notification.views import research_procedures_notif
-from django.urls import reverse
-from django.contrib.auth.decorators import login_required
-import datetime
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from django.conf import settings
+from django_filters.rest_framework import DjangoFilterBackend
 from django.utils import timezone
+from django.http import HttpResponse
+from datetime import timedelta
 
-from collections import defaultdict
-from applications.filetracking.sdk.methods import *
+from ..models import (
+    ResearchGroup, ResearchArea, FundingAgency, SponsoredProject,
+    ProjectExpenditure, ProjectMilestone, ProjectReport,
+    ConsultancyProject, Publication, Patent, PatentStatusNotification, ResearchScholar,
+    TechTransfer, ResearchProject
+)
+from applications.globals.permissions import (
+    IsDeanFacultyOrAdmin,
+    IsFacultyCreateOrReadOnly,
+    IsRSPCAdminOrReadOnly,
+    RoleChecks,
+    RSPC_ROLE_RSPC_ADMIN,
+    RSPC_ROLE_DEAN_RSPC,
+    RSPC_ROLE_DIRECTOR,
+)
 
-# # Faculty can file patent and view status of it.
+from ..selectors import (
+    ResearchGroupSelector, ResearchAreaSelector, FundingAgencySelector,
+    SponsoredProjectSelector, ProjectExpenditureSelector, ProjectMilestoneSelector,
+    ProjectReportSelector, PublicationSelector, PatentSelector, ResearchScholarSelector,
+    FacultyResearchSelector, DepartmentResearchSelector
+)
 
-# @login_required
-# def patent_registration(request):
+from .serializers import (
+    ResearchGroupListSerializer, ResearchGroupDetailSerializer, ResearchGroupCreateUpdateSerializer,
+    ResearchAreaSerializer, FundingAgencySerializer,
+    SponsoredProjectListSerializer, SponsoredProjectDetailSerializer, SponsoredProjectCreateUpdateSerializer,
+    ProjectExpenditureSerializer, ProjectMilestoneSerializer, ProjectReportSerializer,
+    ConsultancyProjectListSerializer, ConsultancyProjectDetailSerializer, ConsultancyProjectCreateUpdateSerializer,
+    PublicationSerializer, PatentSerializer, ResearchScholarSerializer,
+    TechTransferSerializer, ResearchProjectSerializer
+)
 
-   
-#     return render(request ,"rs/research.html")
 
-# @login_required
-# #dean_rspc can update status of patent.   
-# def patent_status_update(request):
-    
-#     user = request.user
-#     user_extra_info = ExtraInfo.objects.get(user=user)
-#     user_designations = HoldsDesignation.objects.filter(user=user)
-#     if request.method=='POST':
-#         if(user_designations.exists()):
-#             if(user_designations.first().designation.name == "dean_rspc" and user_extra_info.user_type == "faculty"):
-#                 patent_application_id = request.POST.get('id')
-#                 patent = Patent.objects.get(application_id=patent_application_id)
-#                 patent.status = request.POST.get('status')
-#                 patent.save()
-#                 messages.success(request, 'Patent status updated successfully')
-#                 # Create a notification for the user about the patent status update
-#                 dean_rspc_user = HoldsDesignation.objects.get(designation=Designation.objects.filter(name='dean_rspc').first()).working
-#                 research_procedures_notif(dean_rspc_user,patent.faculty_id.user,request.POST.get('status'))
-#             else:
-#                 messages.error(request, 'Only Dean RSPC can update status of patent')
-#     return redirect(reverse("research_procedures:patent_registration"))
+# ==================== RESEARCH GROUP ====================
 
-# @login_required
-# def research_group_create(request):
-    
-#     user = request.user
-#     user_extra_info = ExtraInfo.objects.get(user=user)
-#     if request.method=='POST':
-#         if user_extra_info.user_type == "faculty":
-#             form = ResearchGroupForm(request.POST)
-            
-#             if form.is_valid():
-#                 form.save()
-#                 messages.success(request, 'Research group created successfully')
-#         else:
-#             messages.error(request, 'Only Faculty can create research group')
-#     return redirect(reverse("research_procedures:patent_registration"))
+class ResearchGroupViewSet(viewsets.ModelViewSet):
 
-# @login_required
-# def project_insert(request):
-#     user = get_object_or_404(ExtraInfo, user=request.user)
-#     pf = user.id
+    permission_classes = [IsFacultyCreateOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
 
-#     research_project = ResearchProject()
-#     research_project.user = request.user
-#     research_project.pf_no = pf
-#     research_project.pi = request.POST.get('pi')
-#     research_project.co_pi = request.POST.get('co_pi')
-#     research_project.title = request.POST.get('title')
-#     research_project.financial_outlay = request.POST.get('financial_outlay')
-#     research_project.funding_agency = request.POST.get('funding_agency')
-#     research_project.status = request.POST.get('status')
-#     x = request.POST.get('start')
-#     if x[:5] == "Sept." :
-#         x = "Sep." + x[5:]
-#     if (request.POST.get('start') != None and request.POST.get('start') != '' and request.POST.get('start') != 'None'):
-#         try:
-#             research_project.start_date = datetime.datetime.strptime(x, "%B %d, %Y")
-#         except:
-#             research_project.start_date = datetime.datetime.strptime(x, "%b. %d, %Y")
-#     x = request.POST.get('end')
-#     if x[:5] == "Sept." :
-#         x = "Sep." + x[5:]
-#     if (request.POST.get('end') != None and request.POST.get('end') != '' and request.POST.get('end') != 'None'):
-#         try:
-#             research_project.finish_date = datetime.datetime.strptime(x, "%B %d, %Y")
-#         except:
-#             research_project.finish_date = datetime.datetime.strptime(x, "%b. %d, %Y")
-#     x = request.POST.get('sub')
-#     if x[:5] == "Sept." :
-#         x = "Sep." + x[5:]
-#     if (request.POST.get('sub') != None and request.POST.get('sub') != '' and request.POST.get('sub') != 'None'):
-#         try:
-#             research_project.date_submission = datetime.datetime.strptime(x, "%B %d, %Y")
-#         except:
-#             research_project.date_submission = datetime.datetime.strptime(x, "%b. %d, %Y")
-#     research_project.save()
-#     messages.success(request, 'Successfully created research project')
-#     return redirect(reverse("research_procedures:patent_registration"))
+    filterset_fields = ['is_active', 'discipline']
+    search_fields = ['name', 'acronym', 'description']
+    ordering_fields = ['name', 'established_date']
 
-# @login_required
-# def consult_insert(request):
-#     user = get_object_or_404(ExtraInfo, user=request.user)
-#     pf = user.id
-#     consultancy_project = ConsultancyProject()
-#     consultancy_project.user = request.user
-#     consultancy_project.pf_no = pf
-#     consultancy_project.consultants = request.POST.get('consultants')
-#     consultancy_project.client = request.POST.get('client')
-#     consultancy_project.title = request.POST.get('title')
-#     consultancy_project.financial_outlay = request.POST.get('financial_outlay')
-#     x = request.POST.get('start')
-#     if x[:5] == "Sept." :
-#         x = "Sep." + x[5:]
-#     if (request.POST.get('start') != None and request.POST.get('start') != '' and request.POST.get('start') != 'None'):
-#         try:
-#             consultancy_project.start_date = datetime.datetime.strptime(x, "%B %d, %Y")
-#         except:
-#             consultancy_project.start_date = datetime.datetime.strptime(x, "%b. %d, %Y")
-#     x = request.POST.get('end')
-#     if x[:5] == "Sept." :
-#         x = "Sep." + x[5:]
-#     if (request.POST.get('end') != None and request.POST.get('end') != '' and request.POST.get('end') != 'None'):
-#         try:
-#             consultancy_project.end_date = datetime.datetime.strptime(x, "%B %d, %Y")
-#         except:
-#             consultancy_project.end_date = datetime.datetime.strptime(x, "%b. %d, %Y")
-#     consultancy_project.save()
-#     messages.success(request,"Successfully created consultancy project")
-#     return redirect(reverse("research_procedures:patent_registration"))
+    ordering = ['-established_date']
 
-def add_projects(request):
-    if request.method== "POST":
-        obj= request.POST
-        projectname= obj.get('project_name')
-        projecttype= obj.get('project_type')
-        fo= obj.get('financial_outlay')
-        pid= obj.get('project_investigator_id')
-        copid=obj.get('co_project_investigator_id')
-        sa= obj.get('sponsored_agency')
-        startd= obj.get('start_date')
-        subd= obj.get('finish_date')
-        finishd= obj.get('finish_date')
-        years= obj.get('number_of_years')
-        # project_description= obj.get('description')
-        project_info_file= request.FILES.get('project_info_file')
+    def get_queryset(self):
+        return ResearchGroupSelector.get_all_active_groups()
 
-        check = User.objects.filter(username=pid) 
-        # print(check[0].username)
+    def get_serializer_class(self):
+        if self.action == 'list':
+            return ResearchGroupListSerializer
+        elif self.action == 'retrieve':
+            return ResearchGroupDetailSerializer
+        return ResearchGroupCreateUpdateSerializer
 
-       
-        
-        check= HoldsDesignation.objects.filter(user__username=pid , designation__name= "Professor")
-        if not check.exists():
-                check= HoldsDesignation.objects.filter(user__username=pid , designation__name= "Assistant Professor")
 
-                if not check.exists():
-                    messages.error(request,"Request not added, no such project investigator exists 2")
-                    return render(request,"rs/projects.html")  
+# ==================== RESEARCH AREA ====================
 
-        
-        check= HoldsDesignation.objects.filter(user__username=copid , designation__name= "Professor")
-        if not check.exists():
-                check= HoldsDesignation.objects.filter(user__username=copid , designation__name= "Assistant Professor")
+class ResearchAreaViewSet(viewsets.ModelViewSet):
 
-                if not check.exists():
-                    messages.error(request,"Request not added, no such project investigator exists 2")
-                    return render(request,"rs/projects.html")  
+    queryset = ResearchArea.objects.all()
+    serializer_class = ResearchAreaSerializer
+    permission_classes = [AllowAny]  # Lookup table: open in local dev
 
-        
-        obj= projects.objects.all()
-        if len(obj)==0 :
-            projectid=1
-        
-        else :
-            projectid= obj[0].project_id+1
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['discipline', 'is_active']
+    search_fields = ['name', 'description']
 
-        userpi_instance = User.objects.get(username=pid)
-        usercpi_instance = User.objects.get(username=copid)
 
-        projects.objects.create(
-            project_id=projectid,
-            project_name=projectname,
-            project_type=projecttype, 
-            status=0,
-            project_investigator_id=userpi_instance,
-            co_project_investigator_id=usercpi_instance,
-            sponsored_agency=sa,
-            start_date=startd,
-            submission_date=finishd,
-            finish_date=finishd,
-            years=years,
-            project_info_file=project_info_file
-           
-        )
-        project_investigator_designation = HoldsDesignation.objects.get(user=userpi_instance).designation
+# ==================== FUNDING AGENCY ====================
 
-        file_x= create_file(
-            uploader=request.user.username,
-            uploader_designation="rspc_admin",
-            receiver= pid,
-            receiver_designation=project_investigator_designation, 
-            src_module="research_procedures",
-            src_object_id= projectid,
-            file_extra_JSON= { "message": "Project added successfully"},
-            attached_file= project_info_file, 
-        )
+class FundingAgencyViewSet(viewsets.ReadOnlyModelViewSet):
 
-        messages.success(request,"Project added successfully")
-        categories = category.objects.all()
+    serializer_class = FundingAgencySerializer
+    permission_classes = [AllowAny]  # Lookup table: open in local dev
 
-        data = {
-            "pid": pid,
-            "years": list(range(1, int(years) + 1)),    
-            "categories": categories,
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['agency_type', 'country']
+    search_fields = ['name', 'acronym']
+
+    ordering = ['name']
+
+    def get_queryset(self):
+        return FundingAgencySelector.get_all_agencies()
+
+
+# ==================== SPONSORED PROJECT ====================
+
+class SponsoredProjectViewSet(viewsets.ModelViewSet):
+
+    permission_classes = [IsFacultyCreateOrReadOnly]
+
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter]
+    filterset_fields = ['status', 'funding_agency']
+    search_fields = ['title', 'project_number']
+
+    ordering = ['-start_date']
+
+    def perform_create(self, serializer):
+        project = serializer.save()
+
+        if project.status == 'DRAFT':
+            return
+
+        if not project.status or project.status == 'PROPOSED':
+            project.status = 'SUBMITTED'
+            project.save(update_fields=['status'])
+
+    def get_queryset(self):
+        return SponsoredProjectSelector.get_all_projects()
+
+    def get_serializer_class(self):
+
+        if self.action == 'list':
+            return SponsoredProjectListSerializer
+
+        elif self.action == 'retrieve':
+            return SponsoredProjectDetailSerializer
+
+        return SponsoredProjectCreateUpdateSerializer
+
+    @action(detail=True, methods=['post'])
+    def update_status(self, request, pk=None):
+
+        try:
+
+            project = SponsoredProject.objects.get(id=pk)
+            new_status = request.data.get('status')
+
+            if not new_status:
+                return Response({"error": "status required"}, status=400)
+
+            allowed = {choice[0] for choice in SponsoredProject.PROJECT_STATUS_CHOICES}
+            if new_status not in allowed:
+                return Response({"error": "Invalid status"}, status=400)
+
+            project.status = new_status
+            project.save()
+
+            return Response(SponsoredProjectDetailSerializer(project).data)
+
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['get'])
+    def project_details(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            payload = SponsoredProjectDetailSerializer(project).data
+            payload['co_pi_details'] = [
+                {
+                    'id': copi.pk,
+                    'name': copi.id.user.get_full_name() or copi.id.user.username,
+                    'designation': copi.id.title,
+                }
+                for copi in project.co_principal_investigators.all()
+            ]
+            return Response(payload)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def modify_duration(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            years = int(request.data.get('years', 0))
+            if years <= 0:
+                return Response({"error": "years must be a positive integer"}, status=400)
+
+            project.duration_months = years * 12
+            if project.start_date:
+                project.extended_end_date = project.start_date + timedelta(days=(years * 365))
+            project.save()
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except ValueError:
+            return Response({"error": "Invalid years value"}, status=400)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def save_draft(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            project.status = 'DRAFT'
+            project.save(update_fields=['status'])
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def resubmit(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            if project.status not in {'DRAFT', 'REJECTED'}:
+                return Response({"error": "Only DRAFT or REJECTED projects can be resubmitted"}, status=400)
+
+            project.status = 'SUBMITTED'
+            project.save(update_fields=['status'])
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def vet_hod(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            user = request.user
+            if not settings.DEBUG and not RoleChecks.is_department_head(user):
+                return Response({"error": "Department Head role required"}, status=403)
+
+            # BR-017: if PI is also HoD, departmental review can be skipped.
+            if project.principal_investigator_id:
+                pi_user = project.principal_investigator.id.user
+                if pi_user == user:
+                    project.status = 'VERIFIED_BY_ADMIN'
+                    project.save(update_fields=['status'])
+                    return Response(SponsoredProjectDetailSerializer(project).data)
+
+            if project.status not in {'SUBMITTED'}:
+                return Response({"error": "Only submitted projects can be vetted"}, status=400)
+
+            project.status = 'VETTED_BY_HOD'
+            project.save(update_fields=['status'])
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def verify_admin(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            user = request.user
+            if not settings.DEBUG and not RoleChecks.has_rspc_role(user, RSPC_ROLE_RSPC_ADMIN):
+                return Response({"error": "RSPC Admin role required"}, status=403)
+
+            if project.status not in {'VETTED_BY_HOD', 'SUBMITTED'}:
+                return Response({"error": "Project must be vetted/submitted before admin verification"}, status=400)
+
+            project.status = 'VERIFIED_BY_ADMIN'
+            project.save(update_fields=['status'])
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def dean_decision(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            user = request.user
+            if not settings.DEBUG and not RoleChecks.has_rspc_role(user, RSPC_ROLE_DEAN_RSPC):
+                return Response({"error": "Dean-RSPC role required"}, status=403)
+
+            decision = (request.data.get('decision') or '').upper()
+            if decision not in {'APPROVE', 'REJECT', 'FORWARD_DIRECTOR'}:
+                return Response({"error": "decision must be APPROVE, REJECT, or FORWARD_DIRECTOR"}, status=400)
+
+            if project.status not in {'VERIFIED_BY_ADMIN', 'UNDER_REVIEW'}:
+                return Response({"error": "Project must be verified by admin before dean decision"}, status=400)
+
+            if decision == 'APPROVE':
+                project.status = 'APPROVED'
+            elif decision == 'REJECT':
+                project.status = 'REJECTED'
+            else:
+                project.status = 'FORWARDED_TO_DIRECTOR'
+
+            project.save(update_fields=['status'])
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def director_decision(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+            user = request.user
+            if not settings.DEBUG and not RoleChecks.has_rspc_role(user, RSPC_ROLE_DIRECTOR):
+                return Response({"error": "Director role required"}, status=403)
+
+            decision = (request.data.get('decision') or '').upper()
+            if decision not in {'APPROVE', 'REJECT'}:
+                return Response({"error": "decision must be APPROVE or REJECT"}, status=400)
+
+            if project.status not in {'FORWARDED_TO_DIRECTOR'}:
+                return Response({"error": "Project must be forwarded to director"}, status=400)
+
+            project.status = 'APPROVED' if decision == 'APPROVE' else 'REJECTED'
+            project.save(update_fields=['status'])
+            return Response(SponsoredProjectDetailSerializer(project).data)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+    @action(detail=True, methods=['get'])
+    def download_pdf(self, request, pk=None):
+        try:
+            project = SponsoredProject.objects.get(id=pk)
+        except SponsoredProject.DoesNotExist:
+            return Response({"error": "Project not found"}, status=404)
+
+        try:
+            from reportlab.pdfgen import canvas
+        except Exception:
+            return Response({"error": "reportlab is required for PDF generation"}, status=500)
+
+        response = HttpResponse(content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename="project_{project.project_number}.pdf"'
+        pdf = canvas.Canvas(response)
+        y = 800
+        for line in [
+            f"Project Number: {project.project_number}",
+            f"Title: {project.title}",
+            f"PI: {project.principal_investigator}",
+            f"Status: {project.status}",
+            f"Sanctioned Amount: {project.sanctioned_amount}",
+            f"Utilized Amount: {project.utilized_amount}",
+            f"Start Date: {project.start_date}",
+            f"End Date: {project.original_end_date}",
+        ]:
+            pdf.drawString(72, y, line)
+            y -= 22
+        pdf.showPage()
+        pdf.save()
+        return response
+
+
+# ==================== PROJECT EXPENDITURE ====================
+
+class ProjectExpenditureViewSet(viewsets.ModelViewSet):
+
+    serializer_class = ProjectExpenditureSerializer
+    permission_classes = [IsRSPCAdminOrReadOnly]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['project', 'status']
+
+    ordering = ['-date']
+
+    def get_queryset(self):
+
+        project_id = self.request.query_params.get("project_id") or self.request.query_params.get("project")
+
+        if project_id:
+            return ProjectExpenditureSelector.get_project_expenditures(project_id)
+
+        return ProjectExpenditure.objects.all()
+
+    @action(detail=False, methods=['get'])
+    def stipend_disbursements(self, request):
+        queryset = self.get_queryset().filter(expenditure_head='MANPOWER')
+        return Response(self.get_serializer(queryset, many=True).data)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+
+        try:
+
+            expenditure = ProjectExpenditure.objects.get(id=pk)
+
+            # BR-009: enforce approval authority by stipend amount tiers.
+            if expenditure.expenditure_head == 'MANPOWER':
+                amount = expenditure.amount or 0
+                user = request.user
+                if amount <= 50000 and not RoleChecks.has_rspc_role(user, RSPC_ROLE_RSPC_ADMIN):
+                    return Response({"error": "RSPC Admin approval required for stipend <= 50,000"}, status=403)
+                if 50000 < amount <= 200000 and not RoleChecks.has_rspc_role(user, RSPC_ROLE_DEAN_RSPC):
+                    return Response({"error": "Dean-RSPC approval required for stipend between 50,001 and 200,000"}, status=403)
+                if amount > 200000 and not RoleChecks.has_rspc_role(user, RSPC_ROLE_DIRECTOR):
+                    return Response({"error": "Director approval required for stipend above 200,000"}, status=403)
+
+            expenditure.status = "APPROVED"
+            expenditure.approved_by = None
+            expenditure.save()
+
+            return Response(self.get_serializer(expenditure).data)
+
+        except ProjectExpenditure.DoesNotExist:
+            return Response({"error": "Expenditure not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+
+        try:
+
+            expenditure = ProjectExpenditure.objects.get(id=pk)
+
+            remarks = request.data.get("remarks", "")
+
+            expenditure.status = "REJECTED"
+            expenditure.remarks = remarks
+            expenditure.save()
+
+            return Response(self.get_serializer(expenditure).data)
+
+        except ProjectExpenditure.DoesNotExist:
+            return Response({"error": "Expenditure not found"}, status=404)
+
+
+# ==================== PROJECT MILESTONE ====================
+
+class ProjectMilestoneViewSet(viewsets.ModelViewSet):
+
+    serializer_class = ProjectMilestoneSerializer
+    permission_classes = [IsRSPCAdminOrReadOnly]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['project', 'status']
+
+    def get_queryset(self):
+
+        project_id = self.request.query_params.get("project_id") or self.request.query_params.get("project")
+
+        if project_id:
+            return ProjectMilestoneSelector.get_project_milestones(project_id)
+
+        return ProjectMilestone.objects.all()
+
+
+# ==================== PROJECT REPORT ====================
+
+class ProjectReportViewSet(viewsets.ModelViewSet):
+
+    serializer_class = ProjectReportSerializer
+    permission_classes = [IsFacultyCreateOrReadOnly]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['project', 'status']
+
+    def get_queryset(self):
+
+        project_id = self.request.query_params.get("project_id") or self.request.query_params.get("project")
+
+        if project_id:
+            return ProjectReportSelector.get_project_reports(project_id)
+
+        return ProjectReport.objects.all()
+
+class ConsultancyProjectViewSet(viewsets.ModelViewSet):
+    """
+    API View for Consultancy Projects
+    """
+
+    permission_classes = [IsFacultyCreateOrReadOnly]
+    filter_backends = [DjangoFilterBackend, filters.SearchFilter, filters.OrderingFilter]
+
+    filterset_fields = ['status', 'client_type']
+    search_fields = ['title', 'project_number', 'client_name']
+
+    ordering = ['-start_date']
+
+    def perform_create(self, serializer):
+        consultancy = serializer.save()
+
+        if consultancy.status == 'DRAFT':
+            return
+
+        if not consultancy.status or consultancy.status == 'PROPOSED':
+            consultancy.status = 'SUBMITTED'
+            consultancy.save(update_fields=['status'])
+
+    def get_queryset(self):
+        return ConsultancyProject.objects.all()
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return ConsultancyProjectListSerializer
+        elif self.action == "retrieve":
+            return ConsultancyProjectDetailSerializer
+        return ConsultancyProjectCreateUpdateSerializer
+# ==================== PUBLICATION ====================
+
+class PublicationViewSet(viewsets.ModelViewSet):
+
+    serializer_class = PublicationSerializer
+    permission_classes = [IsRSPCAdminOrReadOnly]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['year', 'publication_type']
+
+    ordering = ['-year']
+
+    def get_queryset(self):
+        return PublicationSelector.get_all_publications()
+
+    @action(detail=True, methods=['post'])
+    def verify(self, request, pk=None):
+
+        try:
+
+            publication = Publication.objects.get(id=pk)
+
+            publication.is_verified = True
+            publication.verified_by = None
+            publication.verification_date = timezone.now().date()
+            publication.save()
+
+            return Response(self.get_serializer(publication).data)
+
+        except Publication.DoesNotExist:
+            return Response({"error": "Publication not found"}, status=404)
+
+
+# ==================== PATENT ====================
+
+class PatentViewSet(viewsets.ModelViewSet):
+
+    serializer_class = PatentSerializer
+    permission_classes = [IsDeanFacultyOrAdmin]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['status', 'country']
+
+    ordering = ['-filing_date']
+
+    def get_queryset(self):
+        return PatentSelector.get_all_patents()
+
+    @action(detail=True, methods=['post'])
+    def update_status(self, request, pk=None):
+
+        try:
+
+            patent = Patent.objects.get(application_id=pk)
+
+            new_status = request.data.get("status")
+
+            if not new_status:
+                return Response({"error": "status required"}, status=400)
+
+            old_status = patent.status
+            patent.status = new_status
+            patent.save()
+
+            PatentStatusNotification.objects.create(
+                patent=patent,
+                faculty=patent.faculty_id,
+                previous_status=old_status,
+                new_status=new_status,
+                message=f"Patent '{patent.title}' status changed from {old_status} to {new_status}.",
+            )
+
+            return Response(self.get_serializer(patent).data)
+
+        except Patent.DoesNotExist:
+            return Response({"error": "Patent not found"}, status=404)
+
+
+# ==================== RESEARCH SCHOLAR ====================
+
+class ResearchScholarViewSet(viewsets.ModelViewSet):
+
+    serializer_class = ResearchScholarSerializer
+    permission_classes = [IsRSPCAdminOrReadOnly]
+
+    filter_backends = [DjangoFilterBackend]
+    filterset_fields = ['progress_status']
+
+    ordering = ['-enrollment_date']
+
+    def get_queryset(self):
+        return ResearchScholarSelector.get_all_scholars()
+
+    @action(detail=True, methods=['post'])
+    def update_status(self, request, pk=None):
+
+        try:
+
+            scholar = ResearchScholar.objects.get(id=pk)
+
+            new_status = request.data.get("status") or request.data.get("progress_status")
+
+            valid_status = [
+                "COURSEWORK",
+                "COMPREHENSIVE_EXAM",
+                "SYNOPSIS_PHASE",
+                "THESIS_SUBMITTED",
+                "COMPLETED",
+                "DROPPED"
+            ]
+
+            if new_status not in valid_status:
+                return Response({"error": "Invalid status"}, status=400)
+
+            scholar.progress_status = new_status
+            scholar.save()
+
+            return Response(self.get_serializer(scholar).data)
+
+        except ResearchScholar.DoesNotExist:
+            return Response({"error": "Scholar not found"}, status=404)
+
+
+# ==================== LEGACY ====================
+
+class TechTransferViewSet(viewsets.ReadOnlyModelViewSet):
+
+    queryset = TechTransfer.objects.all()
+    serializer_class = TechTransferSerializer
+    permission_classes = [AllowAny] if settings.DEBUG else [IsAuthenticated]
+
+
+class ResearchProjectViewSet(viewsets.ReadOnlyModelViewSet):
+
+    queryset = ResearchProject.objects.all()
+    serializer_class = ResearchProjectSerializer
+    permission_classes = [AllowAny] if settings.DEBUG else [IsAuthenticated]
+
+
+# ==================== STATS ====================
+
+class FacultyResearchProfileView(viewsets.ViewSet):
+
+    permission_classes = [AllowAny] if settings.DEBUG else [IsAuthenticated]  # Public in local testing
+
+    @action(detail=False, methods=['get'], url_path='(?P<faculty_id>[^/.]+)')
+    def retrieve(self, request, faculty_id=None):
+
+        from applications.globals.models import Faculty
+
+        try:
+
+            faculty = Faculty.objects.get(id=faculty_id)
+
+            profile = {
+
+                "faculty": faculty.id,
+
+                "projects": FacultyResearchSelector.get_faculty_projects(faculty_id).count(),
+
+                "funded_amount": str(
+                    FacultyResearchSelector.get_faculty_sponsored_amount(faculty_id)
+                ),
+
+                "publications": PublicationSelector.get_publications_by_faculty(faculty_id).count(),
+
+                "patents": PatentSelector.get_patents_by_faculty(faculty_id).count(),
+            }
+
+            return Response(profile)
+
+        except Faculty.DoesNotExist:
+            return Response({"error": "Faculty not found"}, status=404)
+
+
+class DepartmentResearchStatsView(viewsets.ViewSet):
+
+    permission_classes = [AllowAny] if settings.DEBUG else [IsAuthenticated]  # Public in local testing
+
+    @action(detail=False, methods=['get'], url_path='(?P<department_id>[^/.]+)')
+    def retrieve(self, request, department_id=None):
+
+        from applications.globals.models import DepartmentInfo
+
+        try:
+
+            department = DepartmentInfo.objects.get(id=department_id)
+
+            stats = {
+
+                "department": department.id,
+
+                "total_projects": DepartmentResearchSelector.get_department_projects_count(department_id),
+
+                "total_funding": str(
+                    DepartmentResearchSelector.get_department_total_funding(department_id)
+                ),
+
+                "publications": DepartmentResearchSelector.get_department_publication_count(department_id),
+
+                "patents": DepartmentResearchSelector.get_department_patent_count(department_id),
+            }
+
+            return Response(stats)
+
+        except DepartmentInfo.DoesNotExist:
+            return Response({"error": "Department not found"}, status=404)
+
+
+class InstituteResearchStatsView(viewsets.ViewSet):
+    permission_classes = [AllowAny] if settings.DEBUG else [IsAuthenticated]
+
+    @action(detail=False, methods=['get'])
+    def retrieve(self, request):
+        total_projects = SponsoredProject.objects.count()
+        total_consultancies = ConsultancyProject.objects.count()
+        sanctioned_sum = sum([float(p.sanctioned_amount or 0) for p in SponsoredProject.objects.all()])
+
+        payload = {
+            "total_projects": total_projects,
+            "total_consultancies": total_consultancies,
+            "total_sanctioned_funding": sanctioned_sum,
+            "active_projects": SponsoredProject.objects.filter(status__in=['ONGOING', 'EXTENDED']).count(),
         }
-       
-        return redirect("/research_procedures/financial_outlay/"+str(projectid))
-    return render(request,"rs/projects.html")
-
-def add_fund_requests(request,pj_id):
-    data= {
-        "pj_id": pj_id
-    }
-    return render(request,"rs/add_fund_requests.html",context=data)
-
-def add_staff_requests(request,pj_id):
-    data= {
-        "pj_id": pj_id  
-    }
-    return render(request,"rs/add_staff_requests.html",context=data)
-
-def add_projects(request):
-
-    # designation = getDesignation(request.user.username)
-    # print("designation is " + designation)
-    # if designation != 'rspc_admin':
-    #     messages.error(request, 'Only RSPC Admin can add projects')
-    #     return redirect("/research_procedures")
-
-    if request.method== "POST":
-        obj= request.POST
-        projectname= obj.get('project_name')
-        projecttype= obj.get('project_type')
-        fo= obj.get('financial_outlay')
-        pid= obj.get('project_investigator_id')
-        copid=obj.get('co_project_investigator_id')
-        sa= obj.get('sponsored_agency')
-        startd= obj.get('start_date')
-        subd= obj.get('finish_date')
-        finishd= obj.get('finish_date')
-        years= obj.get('number_of_years')
-        # project_description= obj.get('description')
-        project_info_file= request.FILES.get('project_info_file')
-
-        check = User.objects.filter(username=pid) 
-
-        # print(check[0].username)
+        return Response(payload)
 
 
-       
-        
-        check= get_obj_by_username_and_designation(pid, "Professor") #checking for pid to exist
+class ComplianceReportView(viewsets.ViewSet):
+    permission_classes = [AllowAny] if settings.DEBUG else [IsAuthenticated]
 
-        if not check.exists():
-                check= HoldsDesignation.objects.filter(user__username=pid , designation__name= "Assistant Professor")
+    @action(detail=False, methods=['get'])
+    def retrieve(self, request):
+        project_status = list(SponsoredProject.objects.values('status'))
+        report_status = list(ProjectReport.objects.values('status'))
+        expenditure_status = list(ProjectExpenditure.objects.values('status'))
 
-                if not check.exists():
-                    messages.error(request,"Request not added, no such project investigator exists ")
-                    return render(request,"rs/projects.html")  
-
-        
-        
-        check= get_obj_by_username_and_designation(copid, "Professor") #checking for copid to exist
-
-        if not check.exists():
-                check= HoldsDesignation.objects.filter(user__username=copid , designation__name= "Assistant Professor")
-
-                if not check.exists():
-                    messages.error(request,"Request not added, no such co project investigator exists ")
-                    return render(request,"rs/projects.html")  
-
-        
-        obj= projects.objects.all()
-
-
-        if len(obj)==0 :
-            projectid=1
-        
-        else :
-            projectid= obj[0].project_id+1
-
-        for project in obj:
-            if project.project_name==projectname:
-                messages.error(request,"Request not added, project name already exists")
-                return render(request,"rs/projects.html")
-        
-
-
-        
-
-        userpi_instance = User.objects.get(username=pid)
-        usercpi_instance = User.objects.get(username=copid)
-
-        projects.objects.create(
-            project_id=projectid,
-            project_name=projectname,
-            project_type=projecttype, 
-            status=0,
-            project_investigator_id=userpi_instance,
-            co_project_investigator_id=usercpi_instance,
-            sponsored_agency=sa,
-            start_date=startd,
-            submission_date=finishd,
-            finish_date=finishd,
-            years=years,
-            project_info_file=project_info_file
-           
+        return Response(
+            {
+                "projects": {
+                    "total": SponsoredProject.objects.count(),
+                    "completed": SponsoredProject.objects.filter(status='COMPLETED').count(),
+                    "rejected": SponsoredProject.objects.filter(status='REJECTED').count(),
+                    "status_rows": project_status,
+                },
+                "reports": {
+                    "total": ProjectReport.objects.count(),
+                    "approved": ProjectReport.objects.filter(status='APPROVED').count(),
+                    "pending": ProjectReport.objects.exclude(status='APPROVED').count(),
+                    "status_rows": report_status,
+                },
+                "expenditures": {
+                    "total": ProjectExpenditure.objects.count(),
+                    "approved": ProjectExpenditure.objects.filter(status='APPROVED').count(),
+                    "pending": ProjectExpenditure.objects.filter(status='PENDING').count(),
+                    "status_rows": expenditure_status,
+                },
+            }
         )
-        project_investigator_designation = HoldsDesignation.objects.get(user=userpi_instance).designation
-
-        file_x= create_file(
-            uploader=request.user.username,
-            uploader_designation="rspc_admin",
-            receiver= pid,
-            receiver_designation=project_investigator_designation, 
-            src_module="research_procedures",
-            src_object_id= projectid,
-            file_extra_JSON= { "message": "Project added successfully"},
-            attached_file= project_info_file, 
-        )
-
-        messages.success(request,"Project added successfully")
-        categories = category.objects.all()
-
-        data = {
-            "pid": pid,
-            "years": list(range(1, int(years) + 1)),    
-            "categories": categories,
-        }
-       
-        return redirect("/research_procedures/financial_outlay/"+str(projectid))
-    return render(request,"rs/projects.html")
-@api_view(['GET'])
-def view_projects(request):
-    queryset= projects.objects.all()
-    print('---------------------------------------------------------------')
-    rspc_admin = HoldsDesignation.objects.get(designation__name="rspc_admin")
-    rspc_admin =rspc_admin.user.username
-    data = Project_serializer(queryset, many=True).data
-    if request.user.username == rspc_admin:
-        data= {
-        "projects": data,
-        "username": request.user.username,
-        }
-        return JsonResponse(data,safe=False)
-
-    queryset= projects.objects.filter(project_investigator_id__username= request.user.username)
-    data2 = Project_serializer(queryset, many=True).data
-    data= {
-        "projects": data2,
-        "username": request.user.username,
-    }
-    # print(data)
-    # print(request.user.username)
-    
-    return JsonResponse(data,safe=False)
-def view_project_info(request,id):
-    id= int(id)
-    obj= projects.objects.filter(project_id=id)
-    data = Project_serializer(obj, many=True).data
-
-
-    # data = {
-    #     "project": obj,
-    # }
-    data = {
-        "project": data,
-    }
-    
-    return JsonResponse(data , safe=False)
-
-# def view_requests(request,id):
-        
-#     if id== '1':
-#         queryset= requests.objects.filter(request_type= "staff")
-#     elif id== '0':
-#         rspc_admin = HoldsDesignation.objects.get(designation__name="rspc_admin")
-#         rspc_admin =rspc_admin.user.username
-#         if request.user.username == rspc_admin :
-#             queryset= rspc_inventory.objects.all()
-#             data= {
-#             "requests": queryset,
-#             "username": request.user.username
-#             }   
-#             return render(request,"rs/view_requests.html", context= data)
-        
-           
-#         queryset= rspc_inventory.objects.filter(project_investigator_id = request.user.username )
-#     else:
-#         render(request,"/404.html")
-
-#     data= {
-#         "requests": queryset,
-#         "username": request.user.username,
-#         "id":id,
-#     }
-
-#     # print(data)
-#     # print(request.user.username)
-    
-#     return render(request,"rs/view_requests.html", context= data)
-
-def view_financial_outlay(request,pid):
-
-    table_data=financial_outlay.objects.filter(project_id=pid).order_by('category', 'sub_category')
-    project= projects.objects.get(project_id=pid)
-
-    years = set(table_data.values_list('year', flat=True))
-    
-    category_data = {}
-    for category in table_data.values_list('category', flat=True).distinct():
-        category_data[category] = financial_outlay_serializer(table_data.filter(category=category) , many=True).data
-    # category_data =  category_serializer(category_data , many=True).data
-    
-
-    data = {
-        'table_title': 'Total Budget Outlay',
-        'table_caption': '...',  # Add caption if needed
-        'project_name':project.project_name,
-        'years': list(years),
-        'category_data': category_data,
-    }
-
-    # print(data)
-    return JsonResponse(data , safe=False)
-
-# def submit_closure_report(request,id):
-#     id= int(id)
-#     obj= projects.objects.get(project_id=id)
-#     obj.status= 1; 
-#     obj.save()
-
-#     queryset= projects.objects.filter(project_investigator_id = request.user.username)
-
-#     # print(queryset)
-    
-#     data= {
-#         "projects": queryset,
-#         "username": request.user.username
-#     }
-#     messages.success(request,"Closure report submitted successfully")
-#     return render(request,"rs/view_projects_rspc.html",context=data)
-@api_view(['GET'])
-def view_project_inventory(request,pj_id):
-    pj_id=int(pj_id)
-    queryset= (requests.objects.filter(project_id=pj_id,request_type="funds"))
-    queryset = requests_serializer(queryset , many=True).data
-    
-    # print(queryset)
-    
-    data= {
-        "requests": queryset,
-        "username": request.user.username
-    }
-    return JsonResponse(data , safe=True)
-
-def view_project_staff(request,pj_id):
-    pj_id=int(pj_id)
-    queryset= requests.objects.filter(project_id=pj_id,request_type="staff")
-    queryset = requests_serializer(queryset , many = True).data
-
-
-    # print(queryset)
-    
-    data= {
-        "requests": queryset,
-        "username": request.user.username
-    }
-    return JsonResponse(data , safe = True)
-
-# def projectss(request):
-#     return render(request,"rs/projects.html")
-
-# def view_project_info(request,id):
-#     id= int(id)
-#     obj= projects.objects.get(project_id=id)
-
-
-
-#     data = {
-#         "project": obj,
-#     }
-    
-#     return render(request,"rs/view_project_info.html", context= data)
-
-# def financial_outlay_form(request,pid):
-#     pid= int(pid)
-#     project= projects.objects.get(project_id=pid);
-#     categories = category.objects.all().distinct();
-
-#     categories_with_subcategories = category.objects.values('category_name', 'sub_category_name')
-
-#     # Organize the data into a dictionary
-#     category_subcategory_map = {}
-#     for item in categories_with_subcategories:
-#         category_name = item['category_name']
-#         subcategory = item['sub_category_name']
-#         if category_name in category_subcategory_map:
-#             category_subcategory_map[category_name].append(subcategory)
-#         else:
-#             category_subcategory_map[category_name] = [subcategory]
-
-#     # Pass the organized data to the template
-    
-#     data = {
-#        "project_id": project.project_id,
-#        "project_name":project.project_name,
-#        "years": list(range(1, int(project.years) + 1)),
-#        "category_subcategory_map": category_subcategory_map
-       
-#     }
-
-#     return render(request,"rs/add_financial_outlay.html", context= data)
-# # return render(request,"rs/add_financial_outlay.html", context= data)
-
-
-
-# def add_staff_details(request, pid):
-#     if request.method == 'POST':
-#         obj = request.POST
-#         for key, value in obj.items():
-#             if key.startswith('staff_id'):
-#                 year_count = key.split('-')[-2]
-#                 staff_count = key.split('-')[-1]
-#                 staff_id_key = f'staff_id-{year_count}-{staff_count}'
-#                 staff_name_key = f'staff_name-{year_count}-{staff_count}'
-#                 qualification_key = f'qualification-{year_count}-{staff_count}'
-#                 stipend_key = f'stipend-{year_count}-{staff_count}'
-#                 year = year_count
-#                 staff_id = obj.get(staff_id_key, '').strip()
-#                 staff_name = obj.get(staff_name_key, '').strip()
-#                 qualification = obj.get(qualification_key, '').strip()
-#                 stipend = obj.get(stipend_key, '').strip()
-#                 project_instance = projects.objects.get(project_id=pid)
-#                 # print(type(staff_id))
-#                 ob = staff_allocations.objects.all()
-
-#                 if len(ob) == 0:
-#                     fid = 1
-#                 else:
-#                     fid = ob[0].staff_allocation_id + 1
-
-#                 staff_id_instance = User.objects.get(username=staff_id)
-         
-
-#                 staff_allocations.objects.create(
-#                     staff_allocation_id=fid,
-#                     project_id=project_instance,
-#                     staff_id=staff_id_instance,
-#                     staff_name=staff_name,
-#                     qualification=qualification,
-#                     year=year,
-#                     stipend=stipend
-#                 )
-
-#         return redirect("/research_procedures/view_staff_details/"+str(pid))
-
-#     project = projects.objects.get(project_id=pid)
-
-#     years_passed = int((datetime.datetime.now().date() - project.start_date).days / 365.25)
-
-#     data = {
-#         "project_id": project.project_id,
-#         "project_name" : project.project_name,
-#         "years": list(range(1, int(project.years) + 1)),
-#         "year": int(years_passed) + 1,
-#     }
-
-#     return render(request, "rs/add_staff_details.html", context=data)
-
-@api_view(['GET'])
-def view_staff_details(request, pid):
-    staff_records = staff_allocations.objects.filter(project_id=pid)
-    data_by_year = {}
-    project = projects.objects.get(project_id=pid)
-    # project = Project_serializer(project , many=True).data
-
-    for record in staff_records:
-        year = record.year
-        if year not in data_by_year:
-            data_by_year[year] = []
-        data_by_year[year].append({
-            'staff_id': int(record.staff_id.id),
-            'staff_name': record.staff_name,
-            'qualification': record.qualification,
-            'stipend': record.stipend
-        })
-
-    context = {
-        'data_by_year': data_by_year,
-        'project_name': project.project_name
-        # Add other necessary fields from project here
-    }
-
-    rspc_admin = HoldsDesignation.objects.get(designation__name="rspc_admin")
-
-    return JsonResponse(context, safe=True)
-
-
-# def add_financial_outlay(request,pid):
-#     if request.method == 'POST':
-        
-#         project = projects.objects.get(project_id=pid)
-#         project.financial_outlay_status = 1
-#         project.save()
-        
-#         obj = request.POST
-#         for key, value in obj.items():
-#             if key.startswith('category-select'):                
-#                 year_count = key.split('-')[-2]
-#                 category_count = key.split('-')[-1]
-#                 subcategory_key = f'subcategory-select-{year_count}-{category_count}'
-#                 amount_key = f'amount-{year_count}-{category_count}'
-
-#                 category = value
-#                 subcategory = obj.get(subcategory_key, [''])
-#                 amount = obj.get(amount_key, [''])
-#                 year = int(year_count)
-
-#                 # print(year)
-#                 # print(amount)
-#                 # print(subcategory)
-#                 # print(category)
-#                 project_instance=projects.objects.get(project_id=pid)
-                
-
-#                 ob= financial_outlay.objects.all()
-#                 if len(ob)==0 :
-#                     fid=1
-                
-#                 else :
-#                     fid= ob[0].financial_outlay_id+1
-#                 financial_outlay.objects.create(
-#                     financial_outlay_id=fid,
-#                     project_id=project_instance,
-#                     category=category,
-#                     sub_category=subcategory,
-#                     amount=amount,
-#                     year=year,
-#                     status=0,
-#                     staff_limit=0
-#                 )
-    
-                
-#     return redirect("/research_procedures/view_financial_outlay/"+str(pid))
-
-# def inbox(request):
-    
-    
-#     user_designation= getDesignation(request.user.username)
-#     print(user_designation)
-#     data = view_inbox(request.user.username,user_designation, "research_procedures")
-#     files= []
-#     count =0
-#     for i in data:
-#         count+=1
-#         file1= File.objects.get(id=i['id'])
-#         files.append((count, file1))
-
-
-#     data={
-        
-#         "inbox": data,
-#         "files": files
-#     }
-#     # print(data)
-#     return render(request, "rs/inbox.html",context= data)
-
-# def add_staff_request(request,id):
-#     if request.method == 'POST':
-#         obj= request.POST
-#         projectid = int(id)
-#         receiver = obj.get('receiver')
-
-
-#         sender = request.user.username
-#         file_to_forward= request.FILES.get('file_to_forward')
-#         project_instance=projects.objects.get(project_id=projectid)
-#         receiver_instance=User.objects.get(username=receiver)
-#         sender_designation= HoldsDesignation.objects.get(user= request.user).designation
-#         receiver_designation = HoldsDesignation.objects.get(user= receiver_instance).designation
-
-#         file_x= create_file(
-#             uploader=sender,    
-#             uploader_designation=sender_designation,
-#             receiver= receiver_instance.username,
-#             receiver_designation=receiver_designation, 
-#             src_module="research_procedures",
-#             src_object_id= projectid,
-#             file_extra_JSON= { "message": "Staff request added ("+ str(projectid)+ ")"},
-#             attached_file= file_to_forward, 
-#         )
-#         messages.success(request,"Staff request added successfully")
-
-#     return redirect("/research_procedures/view_project_info/"+ str(projectid))
-
-# def view_request_inbox(request):
-#     user_designation= getDesignation(request.user.username)
-#     print(user_designation)
-#     data = view_inbox(request.user.username,user_designation, "research_procedures")
-#     files= []
-#     count =0
-#     for i in data:
-#         count+=1
-#         file1= File.objects.get(id=i['id'])
-#         files.append((count, file1))
-
-
-#     data={
-        
-#         "inbox": data,
-#         "files": files
-#     }
-#     # print(data)
-#     # return render(request, "rs/view_request_inbox.html",context= data)
-#     return Response(data, status=status.HTTP_200_OK)
-
-
-# def forward_request(request):
-#     if request.method == 'POST':
-#         obj= request.POST
-#         fileid = int(obj.get('file_id'))
-#         receiver = obj.get('receiver')
-#         message= obj.get('message')
-#         receiver_instance= User.objects.get(username=receiver)
-#         receiver_designation= HoldsDesignation.objects.get(user=receiver_instance).designation
-#         sender = request.user.username
-        
-#         filex= get_file_by_id(fileid)
-
-#         file2=create_file(
-#             uploader=sender,
-#             uploader_designation= getDesignation(sender),
-#             receiver= receiver,
-#             receiver_designation=receiver_designation, 
-#             src_module="research_procedures",
-#             src_object_id= filex.src_object_id,
-#             file_extra_JSON= { "message": message},
-#             attached_file= filex.upload_file, 
-#         )
-        
-#         delete_file(fileid)
-#         messages.success(request,"Request forwarded successfully")
-#     return redirect("/research_procedures/view_request_inbox")
-
-
-#     return redirect("/research_procedures/view_request_inbox")
-
-# def getDesignation(us):
-#     user_inst = User.objects.get(username= us)
-#     user_designation= HoldsDesignation.objects.get(user= user_inst).designation
-#     return user_designation
-
-# def get_file_by_id(id):
-#     file1= File.objects.get(id=id)
-#     print(file1)
-#     return file1
-
-# def delete_file(id):
-#     file1= File.objects.get(id=id)
-#     tracking= Tracking.objects.get(file_id=file1)
-#     tracking.delete()
-#     file1.delete()
-#     return
-
-    
-
-
-

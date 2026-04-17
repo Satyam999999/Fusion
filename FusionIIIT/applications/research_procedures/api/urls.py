@@ -1,45 +1,48 @@
+"""
+URL Configuration for RSPC API
+Routes for all API endpoints using DRF ViewSets and DefaultRouter
+"""
+
+from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import *
-from django.urls import include,path
-from django.conf.urls import url
 from . import views
 
-app_name="research_procedures"
-
+# Initialize router
 router = DefaultRouter()
-# router.register(r'patent', PatentViewSet)
 
-urlpatterns = router.urls
+# ==================== MODEL ROUTERS ====================
+router.register(r'research-groups', views.ResearchGroupViewSet, basename='api_research_group')
+router.register(r'research-areas', views.ResearchAreaViewSet, basename='api_research_area')
+router.register(r'funding-agencies', views.FundingAgencyViewSet, basename='api_funding_agency')
+router.register(r'projects', views.SponsoredProjectViewSet, basename='api_sponsored_project')
+router.register(r'expenditures', views.ProjectExpenditureViewSet, basename='api_project_expenditure')
+router.register(r'milestones', views.ProjectMilestoneViewSet, basename='api_project_milestone')
+router.register(r'reports', views.ProjectReportViewSet, basename='api_project_report')
+router.register(r'consultancies', views.ConsultancyProjectViewSet, basename='api_consultancy_project')
+router.register(r'publications', views.PublicationViewSet, basename='api_publication')
+router.register(r'patents', views.PatentViewSet, basename='api_patent')
+router.register(r'scholars', views.ResearchScholarViewSet, basename='api_research_scholar')
 
+# Legacy models
+router.register(r'tech-transfer', views.TechTransferViewSet, basename='api_tech_transfer')
+router.register(r'research-projects', views.ResearchProjectViewSet, basename='api_research_project')
+
+# ==================== API ENDPOINTS ====================
 urlpatterns = [
-      # url(r'^$', views.view_projects, name='patent_registration'),
-      # url(r'^update$', views.patent_status_update, name='patent_status_update'),
-      # url(r'^research_group$', views.research_group_create, name='research_group_create'),
-      # url(r'^project_insert$',views.project_insert,name='project_insert'),
-      # url(r'^consult_insert$',views.consult_insert,name='consult_insert'),
-      # url(r'^add_projects$',views.add_projects,name='add_projects'),
-      # url(r'^view_projects$',views.view_projects,name='view_projects'),
-      # # path('add_requests/<id>/<pj_id>/',views.add_requests,name='add_requests'),
-      # url(r'^api/',include('applications.research_procedures.api.urls')),
-      # path('view_requests/<id>/',views.view_requests),
-      path('projects',views.view_projects),
-      path('view_project_info/<id>/',views.view_project_info),
-      # path('submit_closure_report/<id>/',views.submit_closure_report, name="submit_closure_report"),
-      # path('add_fund_requests/<pj_id>/',views.add_fund_requests, name="add_fund_requests"),
-      # path('add_staff_requests/<pj_id>/',views.add_staff_requests, name="add_staff_requests"),
-      path('view_project_inventory/<pj_id>/',views.view_project_inventory, name="view_project_inventory"),
-      path('view_project_staff/<pj_id>/',views.view_project_staff, name="view_project_staff"),
-      # path('add_financial_outlay/<pid>/',views.add_financial_outlay, name="add_financial_outlay"),
-      # path('financial_outlay/<pid>/',views.financial_outlay_form, name="financial_outlay_form"),
-      path('view_financial_outlay/<pid>/',views.view_financial_outlay, name="view_financial_outlay"),
-      # path('add_staff_details/<pid>/',views.add_staff_details, name="add_staff_details"),
-      path('view_staff_details/<pid>/',views.view_staff_details, name="view_staff_details"),
-      # path('add_staff_request/<id>/',views.add_staff_request, name="add_staff_request"),
-      # path('inbox',views.inbox, name="inbox"),
-      # path('view_request_inbox',views.view_request_inbox, name="view_request_inbox"),
-      # path('forward_request',views.forward_request, name="forward_request"),
-      
-      
-
+    # Router-generated endpoints
+    path('', include(router.urls)),
+    
+    # Statistics endpoints
+    path('faculty/<int:faculty_id>/profile/', views.FacultyResearchProfileView.as_view(
+        {'get': 'retrieve'}
+    ), name='api_faculty_profile'),
+    path('department/<int:department_id>/stats/', views.DepartmentResearchStatsView.as_view(
+        {'get': 'retrieve'}
+    ), name='api_department_stats'),
+    path('institute/stats/', views.InstituteResearchStatsView.as_view(
+        {'get': 'retrieve'}
+    ), name='api_institute_stats'),
+    path('compliance/report/', views.ComplianceReportView.as_view(
+        {'get': 'retrieve'}
+    ), name='api_compliance_report'),
 ]
-print("URL patterns",urlpatterns)
