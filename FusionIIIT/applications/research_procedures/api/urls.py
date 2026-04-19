@@ -23,6 +23,18 @@ router.register(r'publications', views.PublicationViewSet, basename='api_publica
 router.register(r'patents', views.PatentViewSet, basename='api_patent')
 router.register(r'scholars', views.ResearchScholarViewSet, basename='api_research_scholar')
 
+# Governance and controls
+router.register(r'approval-requests', views.ApprovalRequestViewSet, basename='api_approval_requests')
+router.register(r'progress-entries', views.ProgressEntryViewSet, basename='api_progress_entries')
+router.register(r'closure-requests', views.ClosureRequestViewSet, basename='api_closure_requests')
+router.register(r'documents', views.ManagedDocumentViewSet, basename='api_documents')
+router.register(r'rules', views.RuleDefinitionViewSet, basename='api_rules')
+router.register(r'automation-rules', views.AutomationRuleViewSet, basename='api_automation_rules')
+router.register(r'audit-events', views.AuditEventViewSet, basename='api_audit_events')
+router.register(r'recruitment-posts', views.RecruitmentPostViewSet, basename='api_recruitment_posts')
+router.register(r'applications', views.StaffApplicationViewSet, basename='api_staff_applications')
+router.register(r'appointments', views.StaffAppointmentViewSet, basename='api_staff_appointments')
+
 # Legacy models
 router.register(r'tech-transfer', views.TechTransferViewSet, basename='api_tech_transfer')
 router.register(r'research-projects', views.ResearchProjectViewSet, basename='api_research_project')
@@ -31,6 +43,12 @@ router.register(r'research-projects', views.ResearchProjectViewSet, basename='ap
 urlpatterns = [
     # Router-generated endpoints
     path('', include(router.urls)),
+
+    # Governance auth endpoints
+    path('auth/login/', views.GovernanceLoginView.as_view(), name='api_governance_login'),
+    path('auth/logout/', views.GovernanceLogoutView.as_view(), name='api_governance_logout'),
+    path('auth/me/', views.GovernanceMeView.as_view(), name='api_governance_me'),
+    path('auth/change-password/', views.GovernanceChangePasswordView.as_view(), name='api_governance_change_password'),
     
     # Statistics endpoints
     path('faculty/<int:faculty_id>/profile/', views.FacultyResearchProfileView.as_view(

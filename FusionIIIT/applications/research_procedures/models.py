@@ -12,8 +12,22 @@ from decimal import Decimal
 from django.utils import timezone
 from datetime import datetime, date
 
-# Import stub models (standalone mode - no full FusionERP needed)
-from applications.globals.models import ExtraInfo, Faculty, DepartmentInfo, Student, Discipline
+# Import core models from Fusion. Student belongs to academic_information in this codebase,
+# but keep safe fallbacks so legacy deployments still import.
+from applications.globals.models import ExtraInfo, Faculty, DepartmentInfo
+
+try:
+    from applications.programme_curriculum.models import Discipline
+except ImportError:
+    Discipline = DepartmentInfo
+
+try:
+    from applications.academic_information.models import Student
+except ImportError:
+    try:
+        from applications.globals.models import Student
+    except ImportError:
+        Student = User
 
 
 class Constants:
@@ -270,7 +284,7 @@ class SponsoredProject(models.Model):
     date_submission = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, blank=True, null=True)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True)
 
     class Meta:
         ordering = ['-created_at']
@@ -644,7 +658,7 @@ class ConsultancyProject(models.Model):
     date_entry = models.DateField(null=True, blank=True, default=timezone.now)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, blank=True, null=True)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True)
 
     class Meta:
         ordering = ['-created_at']
@@ -721,7 +735,7 @@ class Publication(models.Model):
     )
     student_authors = models.ManyToManyField(
         Student, 
-        related_name='publications', 
+        related_name='rspc_publications', 
         blank=True
     )
     external_authors = models.TextField(blank=True, null=True)
@@ -1060,7 +1074,7 @@ class ResearchScholar(models.Model):
 class TechTransfer(models.Model):
     """Technology transfer activities"""
     
-    user = models.ForeignKey(User, on_delete=models.CASCADE, blank=True, null=True)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True)
     pf_no = models.IntegerField()
     details = models.CharField(max_length=500, default=" ")
     date_entry = models.DateField(null=True, blank=True, default=timezone.now)
@@ -1076,7 +1090,7 @@ class TechTransfer(models.Model):
 class ResearchProject(models.Model):
     """Legacy Research Project model for backward compatibility"""
     
-    user = models.ForeignKey(User, on_delete=models.CASCADE, blank=True, null=True)
+    user = models.ForeignKey(User, on_delete=models.SET_NULL, blank=True, null=True)
     pf_no = models.IntegerField()
     ptype = models.CharField(max_length=100, default="Research")
     pi = models.CharField(max_length=1000, default=" ")
@@ -1098,3 +1112,8 @@ class ResearchProject(models.Model):
 
     def __str__(self):
         return f'PF No.: {self.pf_no}   pi: {self.pi}  title: {self.title}'
+
+
+# Legacy aliases used by pre-existing function-based views.
+projects = ResearchProject
+financial_outlay = ProjectExpenditure

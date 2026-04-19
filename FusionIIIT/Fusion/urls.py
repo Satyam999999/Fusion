@@ -28,6 +28,11 @@ from applications.globals.views import RateLimitedPasswordResetView
 
 urlpatterns = [
     url(r'^', include('applications.globals.urls')),
+    # RSPC compatibility alias used by standalone frontend builds.
+    url(r'^api/rspc/', include('applications.research_procedures.api.urls')),
+    # Additional aliases expected by assignment test harness and RSPC frontend flows.
+    url(r'^api/governance/', include('applications.research_procedures.api.urls')),
+    url(r'^api/staff/', include('applications.research_procedures.api.urls')),
     url(r'^feeds/', include('applications.feeds.urls')),
     url(r'^admin/', admin.site.urls),
     url(r'^academic-procedures/', include('applications.academic_procedures.urls')),

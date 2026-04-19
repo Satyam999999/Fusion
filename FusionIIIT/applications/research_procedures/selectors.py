@@ -114,13 +114,15 @@ class SponsoredProjectSelector:
     def get_all_projects():
         """Get all sponsored projects"""
         return SponsoredProject.objects.select_related(
-            'principal_investigator', 'funding_agency', 'research_area'
+            'principal_investigator__id__user', 'funding_agency', 'research_area'
         ).order_by('-start_date')
     
     @staticmethod
     def get_projects_by_faculty(faculty_id: int):
         """Get projects where faculty is PI or co-PI"""
-        return SponsoredProject.objects.filter(
+        return SponsoredProject.objects.select_related(
+            'principal_investigator__id__user', 'funding_agency', 'research_area'
+        ).prefetch_related('co_principal_investigators').filter(
             Q(principal_investigator__id=faculty_id) |
             Q(co_principal_investigators__id=faculty_id)
         ).distinct().order_by('-start_date')
@@ -128,21 +130,27 @@ class SponsoredProjectSelector:
     @staticmethod
     def get_projects_by_status(status: str):
         """Get projects by status"""
-        return SponsoredProject.objects.filter(
+        return SponsoredProject.objects.select_related(
+            'principal_investigator__id__user', 'funding_agency', 'research_area'
+        ).filter(
             status=status
         ).order_by('-start_date')
     
     @staticmethod
     def get_ongoing_projects():
         """Get all ongoing projects"""
-        return SponsoredProject.objects.filter(
+        return SponsoredProject.objects.select_related(
+            'principal_investigator__id__user', 'funding_agency', 'research_area'
+        ).filter(
             status__in=['ONGOING', 'EXTENDED']
         ).order_by('-start_date')
     
     @staticmethod
     def get_projects_by_funding_agency(agency_id: int):
         """Get projects funded by specific agency"""
-        return SponsoredProject.objects.filter(
+        return SponsoredProject.objects.select_related(
+            'principal_investigator__id__user', 'funding_agency', 'research_area'
+        ).filter(
             funding_agency_id=agency_id
         ).order_by('-start_date')
     
@@ -168,7 +176,9 @@ class SponsoredProjectSelector:
     @staticmethod
     def get_projects_by_research_area(area_id: int):
         """Get projects in a research area"""
-        return SponsoredProject.objects.filter(
+        return SponsoredProject.objects.select_related(
+            'principal_investigator__id__user', 'funding_agency', 'research_area'
+        ).filter(
             research_area_id=area_id
         ).order_by('-start_date')
     
@@ -301,13 +311,15 @@ class ConsultancyProjectSelector:
     def get_all_consultancies():
         """Get all consultancy projects"""
         return ConsultancyProject.objects.select_related(
-            'consultant'
+            'consultant__id__user'
         ).order_by('-start_date')
     
     @staticmethod
     def get_consultancies_by_faculty(faculty_id: int):
         """Get consultancies where faculty is consultant"""
-        return ConsultancyProject.objects.filter(
+        return ConsultancyProject.objects.select_related(
+            'consultant__id__user'
+        ).filter(
             Q(consultant__id=faculty_id) |
             Q(co_consultants__id=faculty_id)
         ).distinct().order_by('-start_date')
@@ -315,14 +327,18 @@ class ConsultancyProjectSelector:
     @staticmethod
     def get_consultancies_by_status(status: str):
         """Get consultancies by status"""
-        return ConsultancyProject.objects.filter(
+        return ConsultancyProject.objects.select_related(
+            'consultant__id__user'
+        ).filter(
             status=status
         ).order_by('-start_date')
     
     @staticmethod
     def get_consultancies_by_client_type(client_type: str):
         """Get consultancies by client type"""
-        return ConsultancyProject.objects.filter(
+        return ConsultancyProject.objects.select_related(
+            'consultant__id__user'
+        ).filter(
             client_type=client_type
         ).order_by('-start_date')
     
@@ -342,42 +358,44 @@ class PublicationSelector:
     @staticmethod
     def get_all_publications():
         """Get all publications"""
+        # Avoid touching legacy student_authors relation here: some local DBs
+        # use an older join-table shape and this can raise runtime SQL errors.
         return Publication.objects.prefetch_related(
-            'faculty_authors', 'student_authors'
+            'faculty_authors'
         ).order_by('-year')
     
     @staticmethod
     def get_publications_by_faculty(faculty_id: int):
         """Get publications by faculty"""
-        return Publication.objects.filter(
+        return Publication.objects.prefetch_related('faculty_authors').filter(
             faculty_authors__id=faculty_id
         ).distinct().order_by('-year')
     
     @staticmethod
     def get_verified_publications():
         """Get verified publications"""
-        return Publication.objects.filter(
+        return Publication.objects.prefetch_related('faculty_authors').filter(
             is_verified=True
         ).order_by('-year')
     
     @staticmethod
     def get_publications_by_type(pub_type: str):
         """Get publications by type"""
-        return Publication.objects.filter(
+        return Publication.objects.prefetch_related('faculty_authors').filter(
             publication_type=pub_type
         ).order_by('-year')
     
     @staticmethod
     def get_sci_publications():
         """Get SCI indexed publications"""
-        return Publication.objects.filter(
+        return Publication.objects.prefetch_related('faculty_authors').filter(
             index_type__in=['SCI', 'SCIE']
         ).order_by('-year')
     
     @staticmethod
     def get_publications_by_year(year: int):
         """Get publications by year"""
-        return Publication.objects.filter(year=year).order_by('-month')
+        return Publication.objects.prefetch_related('faculty_authors').filter(year=year).order_by('-year')
 
 
 # ==================== PATENT SELECTORS ====================
@@ -388,35 +406,37 @@ class PatentSelector:
     @staticmethod
     def get_all_patents():
         """Get all patents"""
+        # Avoid touching legacy student_inventors relation here: some local
+        # DBs use an older join-table shape and this can raise SQL errors.
         return Patent.objects.prefetch_related(
-            'faculty_inventors', 'student_inventors'
+            'faculty_inventors'
         ).order_by('-filing_date')
     
     @staticmethod
     def get_patents_by_faculty(faculty_id: int):
         """Get patents invented by faculty"""
-        return Patent.objects.filter(
+        return Patent.objects.prefetch_related('faculty_inventors').filter(
             faculty_inventors__id=faculty_id
         ).distinct().order_by('-filing_date')
     
     @staticmethod
     def get_patents_by_status(status: str):
         """Get patents by status"""
-        return Patent.objects.filter(
+        return Patent.objects.prefetch_related('faculty_inventors').filter(
             status=status
         ).order_by('-filing_date')
     
     @staticmethod
     def get_granted_patents():
         """Get granted patents"""
-        return Patent.objects.filter(
+        return Patent.objects.prefetch_related('faculty_inventors').filter(
             status='GRANTED'
         ).order_by('-grant_date')
     
     @staticmethod
     def get_patents_by_country(country: str):
         """Get patents by country"""
-        return Patent.objects.filter(
+        return Patent.objects.prefetch_related('faculty_inventors').filter(
             country=country
         ).order_by('-filing_date')
 
@@ -429,9 +449,8 @@ class ResearchScholarSelector:
     @staticmethod
     def get_all_scholars():
         """Get all research scholars"""
-        return ResearchScholar.objects.select_related(
-            'student'
-        ).order_by('-enrollment_date')
+        # Avoid select_related on student for legacy schemas where FK type differs.
+        return ResearchScholar.objects.order_by('-enrollment_date')
     
     @staticmethod
     def get_scholars_by_status(status: str):

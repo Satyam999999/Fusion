@@ -10,10 +10,4 @@ class Migration(migrations.Migration):
         ('research_procedures', '0001_initial'),
     ]
 
-    operations = [
-        migrations.AlterField(
-            model_name='staff_allocations',
-            name='start_date',
-            field=models.DateField(default=datetime.date.today),
-        ),
-    ]
+    operations = []

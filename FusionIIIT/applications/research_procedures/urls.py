@@ -1,7 +1,6 @@
 from django.urls import include,path
 from django.conf.urls import url
 from . import views
-from . import tests
 app_name="research_procedures"
 
 urlpatterns = [
@@ -40,6 +39,4 @@ urlpatterns = [
       #  path('serve-pdf/<str:filename>/', serve_pdf, name='serve_pdf'),
       
       
-      url(r'^test/$',tests.testfun,name = 'test'),
-
 ]

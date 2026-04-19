@@ -438,13 +438,12 @@ def office_module_DeanRSPC_notif(sender, recipient, type):
                 url=url, module=module, verb=verb)
 
 
-def research_procedures_notif(sender, recipient, type):
-    url = 'research_procedures:patent_registration'
+def research_procedures_notif(sender, recipient, type, entity_name="", url_override=None):
+    url = url_override if url_override else 'research_procedures:patent_registration'
     module = 'Research Procedures'
-    sender = sender
-    recipient = recipient
     verb = ""
 
+    # Legacy patent types
     if type == "Approved":
         verb = "Your Patent has been Approved"
     elif type == "Disapproved":
@@ -455,8 +454,19 @@ def research_procedures_notif(sender, recipient, type):
         verb = "Your Patent has been Submitted, wait for the response"
     elif type == "created":
         verb = "A new Patent has been Created"
+    
+    # Generic status updates for Projects/Consultancies/Publications/Expenditures
+    elif type == "status_update":
+        verb = f"Status updated to {entity_name}"
+    elif type == "project_created":
+        verb = f"A new Project '{entity_name}' was created"
+    elif type == "expenditure_approved":
+        verb = f"Expenditure for '{entity_name}' has been approved"
+    elif type == "expenditure_rejected":
+        verb = f"Expenditure for '{entity_name}' has been rejected"
 
-    notify.send(sender=sender,recipient=recipient,url=url,module=module,verb=verb)
+    if verb:
+        notify.send(sender=sender, recipient=recipient, url=url, module=module, verb=verb)
 
 def hostel_notifications(sender, recipient, type):
     url = 'hostelmanagement:hostel_view'

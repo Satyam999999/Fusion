@@ -88,7 +88,7 @@ class FundingAgencyForm(BaseModelForm):
         widgets = {
             'website': forms.URLInput(),
             'email': forms.EmailInput(),
-            'phone': forms.CharField(attrs={'type': 'tel'}),
+            'phone': forms.TextInput(attrs={'type': 'tel'}),
             'contact_info': forms.Textarea(attrs={'rows': 3}),
         }
 
@@ -221,7 +221,7 @@ class ConsultancyProjectForm(BaseModelForm):
             'notes': forms.Textarea(attrs={'rows': 3}),
             'client_contact': forms.Textarea(attrs={'rows': 2}),
             'client_email': forms.EmailInput(),
-            'client_phone': forms.CharField(attrs={'type': 'tel'}),
+            'client_phone': forms.TextInput(attrs={'type': 'tel'}),
             'co_consultants': forms.CheckboxSelectMultiple(),
         }
     

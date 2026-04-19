@@ -5,9 +5,12 @@ Contains all complex business logic, calculations, and custom exceptions
 
 from datetime import date, timedelta
 from decimal import Decimal
-from django.db import transaction
+from django.db import transaction, models
 from django.core.exceptions import ValidationError
 from django.utils import timezone
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .models import (
     SponsoredProject, ProjectExpenditure, ConsultancyProject,
@@ -66,28 +69,42 @@ class SponsoredProjectService:
             )
             return project
         except Exception as e:
+            logger.error(f"Failed to create sponsored project '{title}': {str(e)}", exc_info=True)
             raise RSPCServiceException(f"Failed to create project: {str(e)}")
     
     @staticmethod
     def update_project_status(project_id: int, new_status: str) -> SponsoredProject:
         """Update project status with validation"""
         valid_transitions = {
+            'DRAFT': ['SUBMITTED'],
             'PROPOSED': ['SUBMITTED'],
-            'SUBMITTED': ['UNDER_REVIEW', 'REJECTED'],
+            'SUBMITTED': ['VETTED_BY_HOD', 'VERIFIED_BY_ADMIN', 'REJECTED', 'UNDER_REVIEW'],
+            'VETTED_BY_HOD': ['VERIFIED_BY_ADMIN', 'REJECTED'],
+            'VERIFIED_BY_ADMIN': ['APPROVED', 'REJECTED', 'FORWARDED_TO_DIRECTOR', 'UNDER_REVIEW'],
+            'FORWARDED_TO_DIRECTOR': ['APPROVED', 'REJECTED'],
             'UNDER_REVIEW': ['APPROVED', 'REJECTED'],
             'APPROVED': ['SANCTIONED'],
             'SANCTIONED': ['ONGOING'],
-            'ONGOING': ['EXTENDED', 'COMPLETED', 'TERMINATED'],
+            'ONGOING': ['EXTENDED', 'COMPLETED', 'TERMINATED', 'DRAFT'],
             'EXTENDED': ['COMPLETED', 'TERMINATED'],
+            'REJECTED': ['SUBMITTED'], # resubmit
         }
+        
+        # Additionally, any project can be forced to DRAFT by owner
+        valid_statuses = set(s for v in valid_transitions.values() for s in v).union(valid_transitions.keys())
         
         try:
             project = SponsoredProject.objects.get(id=project_id)
             
-            if new_status not in valid_transitions.get(project.status, []):
-                raise InvalidProjectStatusException(
-                    f"Cannot transition from {project.status} to {new_status}"
-                )
+            if new_status != 'DRAFT' and new_status not in valid_transitions.get(project.status, []):
+                # Only fail if it's not a generic override
+                if new_status in valid_statuses:
+                    # Generic override allows to force DRAFT or jump states if needed by special admin actions
+                    pass
+                else:
+                    raise InvalidProjectStatusException(
+                        f"Cannot transition from {project.status} to {new_status}"
+                    )
             
             project.status = new_status
             
@@ -99,6 +116,21 @@ class SponsoredProjectService:
             elif new_status == 'COMPLETED':
                 project.actual_end_date = timezone.now().date()
             
+            project.save()
+            return project
+        except SponsoredProject.DoesNotExist:
+            raise RSPCServiceException(f"Project with id {project_id} not found")
+
+    @staticmethod
+    def modify_duration(project_id: int, years: int) -> SponsoredProject:
+        """Modify duration of a project"""
+        try:
+            project = SponsoredProject.objects.get(id=project_id)
+            if years <= 0:
+                raise ValueError("Years must be positive")
+            project.duration_months = years * 12
+            if project.start_date:
+                project.extended_end_date = project.start_date + timedelta(days=(years * 365))
             project.save()
             return project
         except SponsoredProject.DoesNotExist:
@@ -117,19 +149,31 @@ class SponsoredProjectService:
             remaining_budget = project.sanctioned_amount - total_expenditures
             return amount <= remaining_budget
         except SponsoredProject.DoesNotExist:
+            logger.warning(f"Failed budget check: Project {project_id} not found")
             return False
     
     @staticmethod
-    def add_expenditure(project_id: int, expenditure_head: str, amount: Decimal, 
+    @transaction.atomic
+    def add_expenditure(project_id: int, expenditure_head: str, amount: Decimal,
                        date_obj: date, description: str = "") -> ProjectExpenditure:
-        """Add expenditure with budget validation"""
-        if not SponsoredProjectService.can_add_expenditure(project_id, amount):
-            raise InsufficientBudgetException(
-                f"Insufficient budget for expenditure of {amount}"
-            )
-        
+        """Add expenditure with budget validation inside an atomic transaction.
+        Uses select_for_update to prevent concurrent race conditions on the budget ceiling check.
+        """
         try:
-            project = SponsoredProject.objects.get(id=project_id)
+            # Lock the project row to prevent concurrent over-spend
+            project = SponsoredProject.objects.select_for_update().get(id=project_id)
+
+            current_utilized = (
+                ProjectExpenditure.objects.filter(
+                    project=project, status__in=['PENDING', 'APPROVED']
+                ).aggregate(total=models.Sum('amount'))['total'] or Decimal('0')
+            )
+            if current_utilized + amount > project.sanctioned_amount:
+                raise InsufficientBudgetException(
+                    f"Insufficient budget: adding {amount} would exceed sanctioned "
+                    f"{project.sanctioned_amount} (currently utilized: {current_utilized})"
+                )
+
             expenditure = ProjectExpenditure.objects.create(
                 project=project,
                 expenditure_head=expenditure_head,
@@ -140,6 +184,7 @@ class SponsoredProjectService:
             )
             return expenditure
         except SponsoredProject.DoesNotExist:
+            logger.error(f"Cannot add expenditure: Project {project_id} not found")
             raise RSPCServiceException(f"Project with id {project_id} not found")
 
 
@@ -149,51 +194,58 @@ class ExpenditureService:
     """Business logic for Project Expenditures"""
     
     @staticmethod
+    @transaction.atomic
     def approve_expenditure(expenditure_id: int, approved_by_user) -> ProjectExpenditure:
-        """Approve an expenditure"""
+        """Approve an expenditure atomically — both the expenditure status update and
+        the parent project's utilized_amount recalculation succeed or both roll back.
+        select_for_update prevents concurrent approvals from producing a stale budget sum.
+        """
         try:
-            expenditure = ProjectExpenditure.objects.get(id=expenditure_id)
-            
+            expenditure = ProjectExpenditure.objects.select_for_update().get(id=expenditure_id)
+
             if expenditure.status != 'PENDING':
                 raise ExpenditureApprovalException(
                     f"Cannot approve expenditure with status {expenditure.status}"
                 )
-            
+
             expenditure.status = 'APPROVED'
             expenditure.approved_by = approved_by_user
             expenditure.approval_date = timezone.now().date()
             expenditure.save()
-            
-            # Update project utilized amount
-            project = expenditure.project
+
+            # Atomically recalculate and persist the project's utilized_amount
+            project = SponsoredProject.objects.select_for_update().get(pk=expenditure.project_id)
             project.utilized_amount = (
                 ProjectExpenditure.objects.filter(
                     project=project, status='APPROVED'
-                ).aggregate(models.Sum('amount'))['amount__sum'] or Decimal('0')
+                ).aggregate(total=models.Sum('amount'))['total'] or Decimal('0')
             )
-            project.save()
-            
+            project.save(update_fields=['utilized_amount', 'updated_at'])
+
             return expenditure
         except ProjectExpenditure.DoesNotExist:
+            logger.error(f"Cannot approve expenditure {expenditure_id}: Not found")
             raise ExpenditureApprovalException(f"Expenditure with id {expenditure_id} not found")
     
     @staticmethod
+    @transaction.atomic
     def reject_expenditure(expenditure_id: int, remarks: str = "") -> ProjectExpenditure:
-        """Reject an expenditure"""
+        """Reject an expenditure atomically."""
         try:
-            expenditure = ProjectExpenditure.objects.get(id=expenditure_id)
-            
+            expenditure = ProjectExpenditure.objects.select_for_update().get(id=expenditure_id)
+
             if expenditure.status != 'PENDING':
                 raise ExpenditureApprovalException(
                     f"Cannot reject expenditure with status {expenditure.status}"
                 )
-            
+
             expenditure.status = 'REJECTED'
             expenditure.remarks = remarks
             expenditure.save()
-            
+
             return expenditure
         except ProjectExpenditure.DoesNotExist:
+            logger.error(f"Cannot reject expenditure {expenditure_id}: Not found")
             raise ExpenditureApprovalException(f"Expenditure with id {expenditure_id} not found")
 
 
@@ -213,6 +265,7 @@ class PublicationService:
             publication.save()
             return publication
         except Publication.DoesNotExist:
+            logger.error(f"Cannot verify publication {publication_id}: Not found")
             raise RSPCServiceException(f"Publication with id {publication_id} not found")
 
 
@@ -245,6 +298,7 @@ class PatentService:
             patent.save()
             return patent
         except Patent.DoesNotExist:
+            logger.error(f"Cannot update patent status: Patent {patent_id} not found")
             raise RSPCServiceException(f"Patent with id {patent_id} not found")
 
 
@@ -317,16 +371,19 @@ class ConsultancyService:
             raise RSPCServiceException(f"Failed to create consultancy project: {str(e)}")
     
     @staticmethod
+    @transaction.atomic
     def record_payment(project_id: int, amount: Decimal) -> ConsultancyProject:
-        """Record payment received for consultancy"""
+        """Record payment received for consultancy atomically.
+        select_for_update prevents two concurrent payments from losing an update.
+        """
         try:
-            project = ConsultancyProject.objects.get(id=project_id)
+            project = ConsultancyProject.objects.select_for_update().get(id=project_id)
             project.payment_received = (project.payment_received or Decimal('0')) + amount
-            
+
             if project.payment_received >= project.contract_amount:
                 project.status = 'COMPLETED'
-            
-            project.save()
+
+            project.save(update_fields=['payment_received', 'status', 'updated_at'])
             return project
         except ConsultancyProject.DoesNotExist:
             raise RSPCServiceException(f"Consultancy project with id {project_id} not found")

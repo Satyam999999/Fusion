@@ -76,3 +76,14 @@ package-lock.json
 
 .DS_Store
 **/generated.pdf
+
+# Local Python environments (including version-suffixed envs)
+.venv/
+.venv*/
+venv/
+venv*/
+
+# Local analysis/evaluation helper artifacts
+reqs_filtered.txt
+*_filtered.txt
+FusionIIIT/rspc_seed_data.py

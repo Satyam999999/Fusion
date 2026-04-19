@@ -391,8 +391,16 @@ class CourseProposalTrackingFile(ModelForm):
 
 class CourseInstructorForm(forms.ModelForm):
     # next_year = datetime.now().year +1
-    max_year = Batch.objects.aggregate(max_year=Max('year'))['max_year']
+    try:
+        max_year = Batch.objects.aggregate(max_year=Max('year'))['max_year']
+    except Exception:
+        max_year = None
     next_year = max_year + 1 if max_year else datetime.now().year + 1
+    try:
+        batch_years = Batch.objects.values_list('year', flat=True).distinct()
+        year_choices = [(year, year) for year in batch_years]
+    except Exception:
+        year_choices = []
     course_id = forms.ModelChoiceField(
         queryset=Course.objects.all(),
         label="Select Course",
@@ -408,7 +416,7 @@ class CourseInstructorForm(forms.ModelForm):
     )
 
     year = forms.ChoiceField(
-        choices=[('', 'Choose a year')] + [(year, year) for year in Batch.objects.values_list('year', flat=True).distinct()]+[(next_year, next_year)],
+        choices=[('', 'Choose a year')] + year_choices + [(next_year, next_year)],
         label="Select Year",
         widget=forms.Select(attrs={'class': 'ui fluid search selection dropdown'})
     )

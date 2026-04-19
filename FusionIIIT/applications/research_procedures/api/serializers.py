@@ -102,7 +102,7 @@ class ProjectMilestoneSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProjectMilestone
-        fields = ['id', 'title', 'description', 'due_date', 'completed_date',
+        fields = ['id', 'project', 'title', 'description', 'due_date', 'completed_date',
                  'status', 'status_display', 'deliverables', 'deliverable_file',
                  'is_overdue', 'created_at', 'updated_at']
         read_only_fields = ['created_at', 'updated_at', 'is_overdue']
@@ -114,7 +114,7 @@ class ProjectReportSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ProjectReport
-        fields = ['id', 'report_type', 'report_type_display', 'period_from', 'period_to',
+        fields = ['id', 'project', 'report_type', 'report_type_display', 'period_from', 'period_to',
                  'summary', 'achievements', 'challenges', 'next_steps', 'status',
                  'status_display', 'submitted_date', 'approved_date', 'comments',
                  'report_file', 'created_at', 'updated_at']
@@ -315,6 +315,19 @@ class ConsultancyProjectCreateUpdateSerializer(serializers.ModelSerializer):
         faculty_share = attrs.get('faculty_share')
         institute_share = attrs.get('institute_share')
 
+        # BR-RSPC-020: Faculty members MUST NOT have more than 2 active consultancy projects.
+        consultant = attrs.get('consultant')
+        status = attrs.get('status', 'PROPOSED')
+        instance_id = self.instance.pk if self.instance else None
+        
+        if consultant and status in {'PROPOSED', 'SUBMITTED', 'VERIFIED_BY_ADMIN', 'APPROVED', 'ONGOING'}:
+            active_count = ConsultancyProject.objects.filter(
+                consultant=consultant,
+                status__in={'PROPOSED', 'SUBMITTED', 'VERIFIED_BY_ADMIN', 'APPROVED', 'ONGOING'}
+            ).exclude(pk=instance_id).count()
+            if active_count >= 2:
+                raise serializers.ValidationError({'consultant': 'BR-RSPC-020: Faculty must not have more than 2 active consultancy projects.'})
+
         if contract_amount is not None and contract_amount <= 0:
             raise serializers.ValidationError({'contract_amount': 'Contract amount must be positive.'})
 
@@ -344,6 +357,14 @@ class ConsultancyProjectCreateUpdateSerializer(serializers.ModelSerializer):
 class PublicationSerializer(serializers.ModelSerializer):
     publication_type_display = serializers.CharField(source='get_publication_type_display', read_only=True)
     index_type_display = serializers.CharField(source='get_index_type_display', read_only=True)
+    student_authors = serializers.SerializerMethodField()
+
+    def get_student_authors(self, obj):
+        try:
+            return list(obj.student_authors.values_list('pk', flat=True))
+        except Exception:
+            # Keep publications endpoint resilient on legacy schemas.
+            return []
 
     class Meta:
         model = Publication
@@ -361,6 +382,13 @@ class PublicationSerializer(serializers.ModelSerializer):
 class PatentSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     patent_type_display = serializers.CharField(source='get_patent_type_display', read_only=True)
+    student_inventors = serializers.SerializerMethodField()
+
+    def get_student_inventors(self, obj):
+        try:
+            return list(obj.student_inventors.values_list('pk', flat=True))
+        except Exception:
+            return []
 
     class Meta:
         model = Patent
@@ -377,8 +405,14 @@ class PatentSerializer(serializers.ModelSerializer):
 class ResearchScholarSerializer(serializers.ModelSerializer):
     progress_status_display = serializers.CharField(source='get_progress_status_display', read_only=True)
     fellowship_type_display = serializers.CharField(source='get_fellowship_type_display', read_only=True)
-    student_name = serializers.CharField(source='student.id.user.get_full_name', read_only=True)
+    student_name = serializers.SerializerMethodField()
     years_enrolled = serializers.SerializerMethodField()
+
+    def get_student_name(self, obj):
+        try:
+            return obj.student.id.user.get_full_name()
+        except Exception:
+            return None
 
     class Meta:
         model = ResearchScholar
