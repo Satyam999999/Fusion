@@ -1,6 +1,6 @@
 from Fusion.settings.common import *
 
-DEBUG = True
+DEBUG = False
 
 SECRET_KEY = os.environ['SECRET_KEY']
 
@@ -27,5 +27,12 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
-    )
+    ),
+    'EXCEPTION_HANDLER': 'applications.research_procedures.api.exceptions.rspc_exception_handler',
 }
+
+SECURE_BROWSER_XSS_FILTER = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
+X_FRAME_OPTIONS = 'DENY'

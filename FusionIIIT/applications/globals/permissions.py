@@ -17,6 +17,12 @@ RSPC_ROLE_DEAN_RSPC  = "dean_rspc"
 RSPC_ROLE_DIRECTOR   = "director"
 RSPC_ROLE_HOD        = "hod"
 
+_RSPC_ADMIN_ALIASES = frozenset([
+    RSPC_ROLE_RSPC_ADMIN,
+    "sectionhead_rspc",
+    "section head rspc",
+])
+
 # Faculty aliases accepted across Fusion
 _FACULTY_ALIASES = frozenset([
     "faculty", "assistant professor", "associate professor", "professor",
@@ -24,7 +30,7 @@ _FACULTY_ALIASES = frozenset([
 
 # All privileged roles that can act on RSPC workflows
 _ELEVATED_ROLES = frozenset([
-    RSPC_ROLE_HOD, RSPC_ROLE_RSPC_ADMIN, RSPC_ROLE_DEAN_RSPC, RSPC_ROLE_DIRECTOR,
+    RSPC_ROLE_HOD, *_RSPC_ADMIN_ALIASES, RSPC_ROLE_DEAN_RSPC, RSPC_ROLE_DIRECTOR,
 ])
 
 # All roles allowed to authenticate into the RSPC module (excludes students)
@@ -61,6 +67,15 @@ class RoleChecks:
         except Exception:
             pass
 
+        # Fallback: treat mapped Faculty users as faculty even if role/designation
+        # rows are missing or inconsistent.
+        try:
+            from applications.globals.models import Faculty
+            if Faculty.objects.filter(id__user=user).exists():
+                roles.add("faculty")
+        except Exception:
+            pass
+
         return roles
 
     @staticmethod
@@ -88,7 +103,7 @@ class RoleChecks:
 
     @staticmethod
     def is_rspc_admin(user):
-        return RoleChecks.has_rspc_role(user, RSPC_ROLE_RSPC_ADMIN)
+        return RoleChecks.has_any_role(user, _RSPC_ADMIN_ALIASES)
 
     @staticmethod
     def is_dean_rspc(user):
@@ -204,7 +219,15 @@ class IsFacultyOrAdmin(BasePermission):
     def has_permission(self, request, view):
         if not (request.user and request.user.is_authenticated):
             return False
-        return RoleChecks.is_faculty(request.user) or RoleChecks.is_rspc_admin(request.user)
+        if RoleChecks.is_rspc_admin(request.user):
+            return True
+
+        roles = RoleChecks._user_roles(request.user)
+        has_faculty_alias = bool(roles.intersection(_FACULTY_ALIASES))
+        has_elevated_role = bool(roles.intersection(_ELEVATED_ROLES))
+        # Treat elevated governance roles as non-faculty for create/update endpoints
+        # guarded by this permission, unless they are explicit RSPC admin.
+        return has_faculty_alias and not has_elevated_role
 
 
 class IsAdminOrAbove(BasePermission):

@@ -15,14 +15,65 @@ from django.utils import timezone
 from django.http import HttpResponse
 from django.contrib.auth import authenticate, login, logout
 from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files.storage import default_storage
 from django.core.files.base import ContentFile
 from django.utils.crypto import get_random_string
-from datetime import datetime, timedelta
+from django.db.models import Sum, Count, Q
+from datetime import datetime
 from copy import deepcopy
 import logging
+from rest_framework.exceptions import PermissionDenied
+from applications.academic_information.models import Student as AcademicStudent
 
 logger = logging.getLogger(__name__)
+
+
+def _api_error(message, status_code=status.HTTP_400_BAD_REQUEST, code="bad_request", details=None):
+    payload = {
+        "error": message,
+        "code": code,
+    }
+    if details is not None:
+        payload["details"] = details
+    return Response(payload, status=status_code)
+
+
+def _safe_research_notification(sender, recipient, notif_type, entity_name, url_override=None):
+    if not recipient:
+        return
+    try:
+        from notification.views import research_procedures_notif
+        kwargs = {
+            "sender": sender,
+            "recipient": recipient,
+            "type": notif_type,
+            "entity_name": entity_name,
+        }
+        if url_override:
+            kwargs["url_override"] = url_override
+        research_procedures_notif(**kwargs)
+    except Exception:
+        logger.exception(
+            "Failed to send notification",
+            extra={"type": notif_type, "entity_name": entity_name},
+        )
+
+
+def _status_breakdown(queryset, field_name="status"):
+    return list(
+        queryset.values(field_name)
+        .annotate(count=Count("id"))
+        .order_by(field_name)
+    )
+
+
+def _login_lock_key(username, client_ip):
+    return f"rspc_login_lock:{username or 'unknown'}:{client_ip or 'na'}"
+
+
+def _login_attempt_key(username, client_ip):
+    return f"rspc_login_attempts:{username or 'unknown'}:{client_ip or 'na'}"
 
 from ..models import (
     ResearchGroup, ResearchArea, FundingAgency, SponsoredProject,
@@ -173,7 +224,20 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
         return [IsFacultyCreateOrReadOnly()]
 
     def perform_create(self, serializer):
-        project = serializer.save()
+        save_kwargs = {'user': self.request.user}
+
+        if not serializer.validated_data.get('principal_investigator'):
+            from applications.globals.models import Faculty, ExtraInfo
+
+            faculty = Faculty.objects.filter(id__user=self.request.user).first()
+            if not faculty:
+                extra = ExtraInfo.objects.filter(user=self.request.user).first()
+                if extra:
+                    faculty, _ = Faculty.objects.get_or_create(id=extra)
+            if faculty:
+                save_kwargs['principal_investigator'] = faculty
+
+        project = serializer.save(**save_kwargs)
 
         if project.status == 'DRAFT':
             return
@@ -184,9 +248,42 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = SponsoredProjectSelector.get_all_projects()
+        user = self.request.user
+
+        # Faculty should only see projects where they are PI or Co-PI.
+        is_elevated_role = RoleChecks.has_any_role(
+            user,
+            [RSPC_ROLE_HOD, RSPC_ROLE_RSPC_ADMIN, RSPC_ROLE_DEAN_RSPC, RSPC_ROLE_DIRECTOR],
+        )
+        if RoleChecks.is_faculty(user) and not is_elevated_role:
+            qs = qs.filter(
+                Q(principal_investigator__id__user=user)
+                | Q(co_principal_investigators__id__user=user)
+            ).distinct()
+
         if self.action in ['retrieve', 'project_details']:
-            qs = qs.prefetch_related('co_principal_investigators__id__user', 'projectexpenditure_set', 'projectmilestone_set', 'projectreport_set')
+            qs = qs.prefetch_related(
+                'co_principal_investigators__id__user',
+                'expenditures',
+                'milestones',
+                'reports',
+            )
         return qs
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        instance = self.get_object()
+
+        # Faculty can update only projects they own; admin override stays allowed.
+        if RoleChecks.is_faculty(user) and not RoleChecks.is_rspc_admin(user):
+            is_owner = (
+                (instance.principal_investigator and instance.principal_investigator.id and instance.principal_investigator.id.user_id == user.id)
+                or instance.co_principal_investigators.filter(id__user=user).exists()
+            )
+            if not is_owner:
+                raise PermissionDenied("Faculty can edit only their own projects")
+
+        serializer.save()
 
     def get_serializer_class(self):
 
@@ -210,31 +307,45 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
             new_status = request.data.get('status')
 
             if not new_status:
-                return Response({"error": "status required"}, status=400)
+                return _api_error("status required", status.HTTP_400_BAD_REQUEST, "missing_status")
 
             allowed = {choice[0] for choice in SponsoredProject.PROJECT_STATUS_CHOICES}
             if new_status not in allowed:
-                return Response({"error": "Invalid status"}, status=400)
+                return _api_error("Invalid status", status.HTTP_400_BAD_REQUEST, "invalid_status")
 
             project.status = new_status
             project.save()
 
-            try:
-                from notification.views import research_procedures_notif
-                research_procedures_notif(
+            recipient = None
+            if getattr(project, 'user', None):
+                recipient = project.user
+            elif (
+                getattr(project, 'principal_investigator', None)
+                and getattr(project.principal_investigator, 'id', None)
+                and getattr(project.principal_investigator.id, 'user', None)
+            ):
+                recipient = project.principal_investigator.id.user
+
+            if recipient is not None:
+                _safe_research_notification(
                     sender=request.user,
-                    recipient=project.user if getattr(project, 'user', None) else project.principal_investigator.id.user,
-                    type="status_update",
+                    recipient=recipient,
+                    notif_type="status_update",
                     entity_name=f"{project.title} ({new_status})",
-                    url_override="research_procedures:project_details"
+                    url_override="research_procedures:project_details",
                 )
-            except Exception:
-                pass
 
             return Response(SponsoredProjectDetailSerializer(project).data)
 
         except SponsoredProject.DoesNotExist:
             return Response({"error": "Project not found"}, status=404)
+        except Exception:
+            logger.exception("Unexpected failure in project status update", extra={"project_id": pk})
+            return _api_error(
+                "Unable to update project status right now. Please try again.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "project_status_update_failed",
+            )
 
     @action(detail=True, methods=['get'])
     def project_details(self, request, pk=None):
@@ -275,18 +386,30 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def save_draft(self, request, pk=None):
         try:
-            project = SponsoredProject.objects.get(id=pk)
-            # RBAC fix: only PI (owner) or RSPC Admin can save drafts
+            project = SponsoredProject.objects.select_related(
+                'principal_investigator__id'
+            ).get(id=pk)
             user = request.user
+
+            # Ownership: match via submitting user OR via the PI FK.
+            # project.user_id can be NULL for projects created through the admin
+            # site or by a different code path, so the PI FK is the authoritative
+            # check for faculty-ownership when user_id is absent.
+            pi_user_id = None
+            if project.principal_investigator_id:
+                try:
+                    pi_user_id = project.principal_investigator.id.user_id
+                except AttributeError:
+                    pass
+
             is_owner = (
-                project.user_id == user.pk or
-                (project.principal_investigator_id and
-                 hasattr(project.principal_investigator, 'id') and
-                 project.principal_investigator.id.user_id == user.pk)
+                (project.user_id is not None and project.user_id == user.pk)
+                or (pi_user_id is not None and pi_user_id == user.pk)
             )
+
             if not is_owner and not RoleChecks.has_rspc_role(user, RSPC_ROLE_RSPC_ADMIN):
                 return Response({"error": "Only the project PI or RSPC Admin may save a draft"}, status=403)
-            
+
             project = SponsoredProjectService.update_project_status(pk, 'DRAFT')
             return Response(SponsoredProjectDetailSerializer(project).data)
         except SponsoredProject.DoesNotExist:
@@ -297,15 +420,23 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def resubmit(self, request, pk=None):
         try:
-            project = SponsoredProject.objects.get(id=pk)
-            # RBAC fix: only PI (owner) may resubmit
+            project = SponsoredProject.objects.select_related(
+                'principal_investigator__id'
+            ).get(id=pk)
             user = request.user
+
+            pi_user_id = None
+            if project.principal_investigator_id:
+                try:
+                    pi_user_id = project.principal_investigator.id.user_id
+                except AttributeError:
+                    pass
+
             is_owner = (
-                project.user_id == user.pk or
-                (project.principal_investigator_id and
-                 hasattr(project.principal_investigator, 'id') and
-                 project.principal_investigator.id.user_id == user.pk)
+                (project.user_id is not None and project.user_id == user.pk)
+                or (pi_user_id is not None and pi_user_id == user.pk)
             )
+
             if not is_owner and not RoleChecks.has_rspc_role(user, RSPC_ROLE_RSPC_ADMIN):
                 return Response({"error": "Only the project PI or RSPC Admin may resubmit"}, status=403)
             if project.status not in {'DRAFT', 'REJECTED'}:
@@ -363,6 +494,12 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def dean_decision(self, request, pk=None):
+        """
+        Amount-based approval routing:
+        - decision=APPROVE and contract_amount <= 800000 → APPROVED (final)
+        - decision=APPROVE and contract_amount >  800000 → FORWARDED_TO_DIRECTOR
+        - decision=REJECT → REJECTED
+        """
         try:
             project = SponsoredProject.objects.get(id=pk)
             user = request.user
@@ -370,18 +507,18 @@ class SponsoredProjectViewSet(viewsets.ModelViewSet):
                 return Response({"error": "Dean-RSPC role required"}, status=403)
 
             decision = (request.data.get('decision') or '').upper()
-            if decision not in {'APPROVE', 'REJECT', 'FORWARD_DIRECTOR'}:
-                return Response({"error": "decision must be APPROVE, REJECT, or FORWARD_DIRECTOR"}, status=400)
+            if decision not in {'APPROVE', 'REJECT'}:
+                return Response({"error": "decision must be APPROVE or REJECT"}, status=400)
 
-            if project.status not in {'VERIFIED_BY_ADMIN', 'UNDER_REVIEW'}:
-                return Response({"error": "Project must be verified by admin before dean decision"}, status=400)
+            if project.status not in {'VETTED_BY_HOD', 'VERIFIED_BY_ADMIN', 'UNDER_REVIEW'}:
+                return Response({"error": "Project must be vetted by HoD before Dean decision"}, status=400)
 
-            if decision == 'APPROVE':
-                new_status = 'APPROVED'
-            elif decision == 'REJECT':
+            if decision == 'REJECT':
                 new_status = 'REJECTED'
             else:
-                new_status = 'FORWARDED_TO_DIRECTOR'
+                # Amount-based routing: 8 Lakh = 800000
+                amount = float(project.sanctioned_amount or 0)
+                new_status = 'APPROVED' if amount <= 800000 else 'FORWARDED_TO_DIRECTOR'
 
             project = SponsoredProjectService.update_project_status(pk, new_status)
             return Response(SponsoredProjectDetailSerializer(project).data)
@@ -469,7 +606,7 @@ class ProjectExpenditureViewSet(viewsets.ModelViewSet):
         'partial_update':         [IsRSPCAdminOnly],
         'destroy':                [IsRSPCAdminOnly],
         'approve':                [IsAdminOrAbove],     # tiered inside the action
-        'reject':                 [IsRSPCAdminOnly],
+        'reject':                 [IsAdminOrAbove],     # tiered inside the action
         'stipend_disbursements':  [IsRSPCAdminOnly],
         'list':                   [IsFacultyCreateOrReadOnly],
         'retrieve':               [IsFacultyCreateOrReadOnly],
@@ -481,9 +618,14 @@ class ProjectExpenditureViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         project_id = self.request.query_params.get("project_id") or self.request.query_params.get("project")
+        base_qs = ProjectExpenditure.objects.select_related(
+            'project',
+            'project__principal_investigator__id__user',
+            'approved_by__user',
+        )
         if project_id:
-            return ProjectExpenditureSelector.get_project_expenditures(project_id)
-        return ProjectExpenditure.objects.all()
+            return base_qs.filter(project_id=project_id).order_by('-date')
+        return base_qs.order_by('-date')
 
     @action(detail=False, methods=['get'])
     def stipend_disbursements(self, request):
@@ -503,66 +645,100 @@ class ProjectExpenditureViewSet(viewsets.ModelViewSet):
             amount = expenditure.amount or 0
             user = request.user
 
-            # General expenditures (non-MANPOWER) require at minimum RSPC Admin
-            if not RoleChecks.has_any_role(
-                user, [RSPC_ROLE_RSPC_ADMIN, RSPC_ROLE_DEAN_RSPC, RSPC_ROLE_DIRECTOR]
-            ):
-                return Response({"error": "At least RSPC Admin role required"}, status=403)
-
-            # BR-009: tiered authority for MANPOWER (stipend) expenditures
-            if expenditure.expenditure_head == 'MANPOWER':
-                if amount <= 50000:
-                    if not RoleChecks.is_rspc_admin(user):
-                        return Response({"error": "RSPC Admin approval required for stipend ≤ 50,000"}, status=403)
-                elif 50000 < amount <= 200000:
-                    if not RoleChecks.is_dean_rspc(user):
-                        return Response({"error": "Dean-RSPC approval required for stipend 50,001–200,000"}, status=403)
-                else:
-                    if not RoleChecks.is_director(user):
-                        return Response({"error": "Director approval required for stipend > 200,000"}, status=403)
+            if amount <= 50000:
+                if not RoleChecks.is_rspc_admin(user):
+                    return Response({"error": "RSPC Admin approval required for expenditure ≤ 50,000"}, status=403)
+            elif 50000 < amount <= 200000:
+                if not RoleChecks.is_dean_rspc(user):
+                    return Response({"error": "Dean-RSPC approval required for expenditure 50,001–200,000"}, status=403)
+            else:
+                if not RoleChecks.is_director(user):
+                    return Response({"error": "Director approval required for expenditure > 200,000"}, status=403)
 
             try:
                 expenditure = ExpenditureService.approve_expenditure(pk, user)
-                try:
-                    from notification.views import research_procedures_notif
-                    research_procedures_notif(
+                recipient = None
+                if getattr(expenditure.project, 'user', None):
+                    recipient = expenditure.project.user
+                elif (
+                    getattr(expenditure.project, 'principal_investigator', None)
+                    and getattr(expenditure.project.principal_investigator, 'id', None)
+                    and getattr(expenditure.project.principal_investigator.id, 'user', None)
+                ):
+                    recipient = expenditure.project.principal_investigator.id.user
+
+                if recipient:
+                    _safe_research_notification(
                         sender=request.user,
-                        recipient=expenditure.project.user if getattr(expenditure.project, 'user', None) else expenditure.project.principal_investigator.id.user,
-                        type="expenditure_approved",
+                        recipient=recipient,
+                        notif_type="expenditure_approved",
                         entity_name=expenditure.project.title,
-                        url_override="research_procedures:project_details"
+                        url_override="research_procedures:project_details",
                     )
-                except Exception:
-                    pass
                 return Response(self.get_serializer(expenditure).data)
             except ExpenditureApprovalException as e:
                 return Response({"error": str(e)}, status=400)
 
         except ProjectExpenditure.DoesNotExist:
             return Response({"error": "Expenditure not found"}, status=404)
+        except Exception:
+            logger.exception("Unexpected failure in expenditure approval", extra={"expenditure_id": pk})
+            return _api_error(
+                "Unable to approve expenditure right now. Please try again.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "expenditure_approve_failed",
+            )
 
     @action(detail=True, methods=['post'])
     def reject(self, request, pk=None):
-        # RSPC Admin only — guarded by _ACTION_PERMS
+        # Tiered authority for rejection mirrors approval tiers.
         try:
+            expenditure = ProjectExpenditure.objects.get(id=pk)
+            amount = expenditure.amount or 0
+            user = request.user
+
+            if amount <= 50000:
+                if not RoleChecks.is_rspc_admin(user):
+                    return Response({"error": "RSPC Admin rejection required for expenditure ≤ 50,000"}, status=403)
+            elif 50000 < amount <= 200000:
+                if not RoleChecks.is_dean_rspc(user):
+                    return Response({"error": "Dean-RSPC rejection required for expenditure 50,001–200,000"}, status=403)
+            else:
+                if not RoleChecks.is_director(user):
+                    return Response({"error": "Director rejection required for expenditure > 200,000"}, status=403)
+
             try:
                 expenditure = ExpenditureService.reject_expenditure(pk, request.data.get("remarks", ""))
-                try:
-                    from notification.views import research_procedures_notif
-                    research_procedures_notif(
+                recipient = None
+                if getattr(expenditure.project, 'user', None):
+                    recipient = expenditure.project.user
+                elif (
+                    getattr(expenditure.project, 'principal_investigator', None)
+                    and getattr(expenditure.project.principal_investigator, 'id', None)
+                    and getattr(expenditure.project.principal_investigator.id, 'user', None)
+                ):
+                    recipient = expenditure.project.principal_investigator.id.user
+
+                if recipient:
+                    _safe_research_notification(
                         sender=request.user,
-                        recipient=expenditure.project.user if getattr(expenditure.project, 'user', None) else expenditure.project.principal_investigator.id.user,
-                        type="expenditure_rejected",
+                        recipient=recipient,
+                        notif_type="expenditure_rejected",
                         entity_name=expenditure.project.title,
-                        url_override="research_procedures:project_details"
+                        url_override="research_procedures:project_details",
                     )
-                except Exception:
-                    pass
                 return Response(self.get_serializer(expenditure).data)
             except ExpenditureApprovalException as e:
                 return Response({"error": str(e)}, status=400)
         except ProjectExpenditure.DoesNotExist:
             return Response({"error": "Expenditure not found"}, status=404)
+        except Exception:
+            logger.exception("Unexpected failure in expenditure rejection", extra={"expenditure_id": pk})
+            return _api_error(
+                "Unable to reject expenditure right now. Please try again.",
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "expenditure_reject_failed",
+            )
 
 
 # ==================== PROJECT MILESTONE ====================
@@ -580,9 +756,9 @@ class ProjectMilestoneViewSet(viewsets.ModelViewSet):
         project_id = self.request.query_params.get("project_id") or self.request.query_params.get("project")
 
         if project_id:
-            return ProjectMilestoneSelector.get_project_milestones(project_id)
+            return ProjectMilestone.objects.select_related('project').filter(project_id=project_id).order_by('due_date')
 
-        return ProjectMilestone.objects.all()
+        return ProjectMilestone.objects.select_related('project').order_by('due_date')
 
 
 # ==================== PROJECT REPORT ====================
@@ -616,8 +792,34 @@ class ProjectReportViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         project_id = self.request.query_params.get("project_id") or self.request.query_params.get("project")
         if project_id:
-            return ProjectReportSelector.get_project_reports(project_id)
-        return ProjectReport.objects.all()
+            return ProjectReport.objects.select_related('project').filter(project_id=project_id).order_by('-period_from')
+        return ProjectReport.objects.select_related('project').order_by('-period_from')
+
+    def perform_create(self, serializer):
+        from django.core.exceptions import ValidationError
+
+        try:
+            report = serializer.save()
+            if report.status in {'SUBMITTED', 'APPROVED'} and not report.submitted_date:
+                report.submitted_date = timezone.now().date()
+                if report.status == 'APPROVED' and not report.approved_date:
+                    report.approved_date = timezone.now().date()
+                report.save(update_fields=['submitted_date', 'approved_date', 'updated_at'])
+        except ValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, 'message_dict') else {'detail': exc.messages})
+
+    def perform_update(self, serializer):
+        from django.core.exceptions import ValidationError
+
+        try:
+            report = serializer.save()
+            if report.status in {'SUBMITTED', 'APPROVED'} and not report.submitted_date:
+                report.submitted_date = timezone.now().date()
+            if report.status == 'APPROVED' and not report.approved_date:
+                report.approved_date = timezone.now().date()
+            report.save(update_fields=['submitted_date', 'approved_date', 'updated_at'])
+        except ValidationError as exc:
+            raise serializers.ValidationError(exc.message_dict if hasattr(exc, 'message_dict') else {'detail': exc.messages})
 
 class ConsultancyProjectViewSet(viewsets.ModelViewSet):
     """
@@ -638,6 +840,11 @@ class ConsultancyProjectViewSet(viewsets.ModelViewSet):
         'update':         [IsFacultyOrAdmin],
         'partial_update': [IsFacultyOrAdmin],
         'destroy':        [IsRSPCAdminOnly],
+        'propose':        [IsFacultyOrAdmin],
+        'submit':         [IsFacultyOrAdmin],
+        'mark_negotiation': [IsFacultyOrAdmin],
+        'approve':        [IsRSPCAdminOnly],
+        'reject':         [IsRSPCAdminOnly],
         'list':           [IsFacultyCreateOrReadOnly],
         'retrieve':       [IsFacultyCreateOrReadOnly],
     }
@@ -647,31 +854,135 @@ class ConsultancyProjectViewSet(viewsets.ModelViewSet):
         return [p() for p in perms] if perms else [IsFacultyCreateOrReadOnly()]
 
     def perform_create(self, serializer):
-        consultancy = serializer.save()
+        save_kwargs = {'user': self.request.user}
+
+        # Attach the consultant automatically for faculty users when frontend does
+        # not provide consultant explicitly.
+        if not serializer.validated_data.get('consultant'):
+            from applications.globals.models import Faculty, ExtraInfo
+
+            faculty = Faculty.objects.filter(id__user=self.request.user).first()
+            if not faculty:
+                extra = ExtraInfo.objects.filter(user=self.request.user).first()
+                if extra:
+                    faculty, _ = Faculty.objects.get_or_create(id=extra)
+            if faculty:
+                save_kwargs['consultant'] = faculty
+
+        consultancy = serializer.save(**save_kwargs)
+
+        # Faculty submissions should always enter workflow as SUBMITTED.
+        is_rspc_admin = RoleChecks.is_rspc_admin(self.request.user) or getattr(self.request.user, 'is_superuser', False)
+        if not is_rspc_admin:
+            if consultancy.status != 'SUBMITTED':
+                consultancy.status = 'SUBMITTED'
+                consultancy.save(update_fields=['status', 'updated_at'])
+            return
+
         if consultancy.status == 'DRAFT':
             return
         if not consultancy.status or consultancy.status == 'PROPOSED':
             consultancy.status = 'SUBMITTED'
-            consultancy.save(update_fields=['status'])
+            consultancy.save(update_fields=['status', 'updated_at'])
 
     def perform_update(self, serializer):
         old_status = serializer.instance.status
         consultancy = serializer.save()
         if old_status != consultancy.status:
+            if getattr(consultancy.consultant, 'id', None) and getattr(consultancy.consultant.id, 'user', None):
+                _safe_research_notification(
+                    sender=self.request.user,
+                    recipient=consultancy.consultant.id.user,
+                    notif_type="status_update",
+                    entity_name=f"Consultancy '{consultancy.title}' ({consultancy.status})",
+                )
+
+    @action(detail=True, methods=['post'])
+    def propose(self, request, pk=None):
+        try:
+            consultancy = ConsultancyProject.objects.get(id=pk)
+            if consultancy.status not in {'DRAFT'}:
+                return Response({"error": "Only draft consultancies can be moved to proposed"}, status=400)
+            consultancy.status = 'PROPOSED'
             try:
-                from notification.views import research_procedures_notif
-                if getattr(consultancy.consultant, 'id', None) and getattr(consultancy.consultant.id, 'user', None):
-                    research_procedures_notif(
-                        sender=self.request.user,
-                        recipient=consultancy.consultant.id.user,
-                        type="status_update",
-                        entity_name=f"Consultancy '{consultancy.title}' ({consultancy.status})"
-                    )
-            except Exception:
-                pass
+                consultancy.save(update_fields=['status', 'updated_at'])
+            except DjangoValidationError as exc:
+                return _api_error("Failed to move consultancy to proposed", details=getattr(exc, 'message_dict', exc.messages))
+            return Response(ConsultancyProjectDetailSerializer(consultancy).data)
+        except ConsultancyProject.DoesNotExist:
+            return Response({"error": "Consultancy not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def submit(self, request, pk=None):
+        try:
+            consultancy = ConsultancyProject.objects.get(id=pk)
+            if consultancy.status not in {'DRAFT', 'PROPOSED'}:
+                return Response({"error": "Only draft/proposed consultancies can be submitted"}, status=400)
+            consultancy.status = 'SUBMITTED'
+            try:
+                consultancy.save(update_fields=['status', 'updated_at'])
+            except DjangoValidationError as exc:
+                return _api_error("Failed to submit consultancy", details=getattr(exc, 'message_dict', exc.messages))
+            return Response(ConsultancyProjectDetailSerializer(consultancy).data)
+        except ConsultancyProject.DoesNotExist:
+            return Response({"error": "Consultancy not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def mark_negotiation(self, request, pk=None):
+        try:
+            consultancy = ConsultancyProject.objects.get(id=pk)
+            if consultancy.status not in {'PROPOSED', 'SUBMITTED'}:
+                return Response({"error": "Only proposed/submitted consultancies can be moved to negotiation"}, status=400)
+            consultancy.status = 'NEGOTIATION'
+            try:
+                consultancy.save(update_fields=['status', 'updated_at'])
+            except DjangoValidationError as exc:
+                return _api_error("Failed to move consultancy to negotiation", details=getattr(exc, 'message_dict', exc.messages))
+            return Response(ConsultancyProjectDetailSerializer(consultancy).data)
+        except ConsultancyProject.DoesNotExist:
+            return Response({"error": "Consultancy not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        try:
+            consultancy = ConsultancyProject.objects.get(id=pk)
+            if consultancy.status not in {'PROPOSED', 'SUBMITTED', 'NEGOTIATION'}:
+                return Response({"error": "Only proposed/submitted/negotiation consultancies can be approved"}, status=400)
+            consultancy.status = 'APPROVED'
+            try:
+                consultancy.save(update_fields=['status', 'updated_at'])
+            except DjangoValidationError as exc:
+                return _api_error("Consultancy approval failed", details=getattr(exc, 'message_dict', exc.messages))
+            return Response(ConsultancyProjectDetailSerializer(consultancy).data)
+        except ConsultancyProject.DoesNotExist:
+            return Response({"error": "Consultancy not found"}, status=404)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        try:
+            consultancy = ConsultancyProject.objects.get(id=pk)
+            if consultancy.status in {'COMPLETED', 'CANCELLED'}:
+                return Response({"error": "Completed/cancelled consultancies cannot be rejected"}, status=400)
+            consultancy.status = 'CANCELLED'
+            try:
+                consultancy.save(update_fields=['status', 'updated_at'])
+            except DjangoValidationError as exc:
+                return _api_error("Consultancy rejection failed", details=getattr(exc, 'message_dict', exc.messages))
+            return Response(ConsultancyProjectDetailSerializer(consultancy).data)
+        except ConsultancyProject.DoesNotExist:
+            return Response({"error": "Consultancy not found"}, status=404)
 
     def get_queryset(self):
         qs = ConsultancyProjectSelector.get_all_consultancies()
+        extra = getattr(self.request.user, "extrainfo", None)
+        if extra and getattr(extra, "user_type", "").lower() == "faculty":
+            faculty = getattr(extra, "faculty", None)
+            if faculty is None:
+                from applications.globals.models import Faculty
+
+                faculty = Faculty.objects.filter(id=extra).first()
+            if faculty:
+                qs = ConsultancyProjectSelector.get_consultancies_by_faculty(faculty.id)
         if self.action in ['retrieve', 'project_details']:
             qs = qs.prefetch_related('co_consultants__id__user')
         return qs
@@ -747,18 +1058,14 @@ class PatentViewSet(viewsets.ModelViewSet):
                 message=f"Patent '{patent.title}' status changed from {old_status} to {new_status}.",
             )
 
-            try:
-                from notification.views import research_procedures_notif
-                if patent.faculty_id and getattr(patent.faculty_id, 'user', None):
-                    notif_type = new_status if new_status in ["Approved", "Disapproved", "Pending", "submitted", "created"] else "status_update"
-                    research_procedures_notif(
-                        sender=request.user,
-                        recipient=patent.faculty_id.user,
-                        type=notif_type,
-                        entity_name=patent.title
-                    )
-            except Exception:
-                pass
+            if patent.faculty_id and getattr(patent.faculty_id, 'user', None):
+                notif_type = new_status if new_status in ["Approved", "Disapproved", "Pending", "submitted", "created"] else "status_update"
+                _safe_research_notification(
+                    sender=request.user,
+                    recipient=patent.faculty_id.user,
+                    notif_type=notif_type,
+                    entity_name=patent.title,
+                )
 
             return Response(self.get_serializer(patent).data)
 
@@ -797,17 +1104,13 @@ class ResearchScholarViewSet(viewsets.ModelViewSet):
                 # The service uses a slightly different valid_statuses list, which is correct
                 return Response({"error": str(e)}, status=400)
 
-            try:
-                from notification.views import research_procedures_notif
-                if getattr(scholar, 'student', None) and getattr(scholar.student.id, 'user', None):
-                    research_procedures_notif(
-                        sender=request.user,
-                        recipient=scholar.student.id.user,
-                        type="status_update",
-                        entity_name=f"Scholar profile ({new_status})",
-                    )
-            except Exception:
-                pass
+            if getattr(scholar, 'student', None) and getattr(scholar.student.id, 'user', None):
+                _safe_research_notification(
+                    sender=request.user,
+                    recipient=scholar.student.id.user,
+                    notif_type="status_update",
+                    entity_name=f"Scholar profile ({new_status})",
+                )
 
             return Response(self.get_serializer(scholar).data)
 
@@ -815,6 +1118,31 @@ class ResearchScholarViewSet(viewsets.ModelViewSet):
             return Response({"error": "Scholar not found"}, status=404)
         except RSPCServiceException as e:
             return Response({"error": str(e)}, status=400)
+
+
+class PhDStudentOptionsView(APIView):
+    """Return unregistered PhD students for scholar registration dropdown."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = (
+            AcademicStudent.objects
+            .select_related('id__user')
+            .filter(programme='PhD')
+            .exclude(research_scholar_info__isnull=False)
+            .order_by('id__user__username')
+        )
+
+        data = [
+            {
+                'id': str(student.pk),
+                'name': student.id.user.get_full_name().strip() or student.id.user.username,
+                'username': student.id.user.username,
+            }
+            for student in qs
+        ]
+        return Response(data)
 
 
 # ==================== LEGACY ====================
@@ -908,9 +1236,16 @@ class InstituteResearchStatsView(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def retrieve(self, request):
+        cache_key = 'rspc:stats:institute:v1'
+        cached_payload = cache.get(cache_key)
+        if cached_payload is not None:
+            return Response(cached_payload)
+
         total_projects = SponsoredProject.objects.count()
         total_consultancies = ConsultancyProject.objects.count()
-        sanctioned_sum = sum([float(p.sanctioned_amount or 0) for p in SponsoredProject.objects.all()])
+        sanctioned_sum = float(
+            SponsoredProject.objects.aggregate(total=Sum('sanctioned_amount')).get('total') or 0
+        )
 
         payload = {
             "total_projects": total_projects,
@@ -918,6 +1253,7 @@ class InstituteResearchStatsView(viewsets.ViewSet):
             "total_sanctioned_funding": sanctioned_sum,
             "active_projects": SponsoredProject.objects.filter(status__in=['ONGOING', 'EXTENDED']).count(),
         }
+        cache.set(cache_key, payload, timeout=120)
         return Response(payload)
 
 
@@ -927,32 +1263,37 @@ class ComplianceReportView(viewsets.ViewSet):
 
     @action(detail=False, methods=['get'])
     def retrieve(self, request):
-        project_status = list(SponsoredProject.objects.values('status'))
-        report_status = list(ProjectReport.objects.values('status'))
-        expenditure_status = list(ProjectExpenditure.objects.values('status'))
+        cache_key = 'rspc:stats:compliance:v1'
+        cached_payload = cache.get(cache_key)
+        if cached_payload is not None:
+            return Response(cached_payload)
 
-        return Response(
-            {
-                "projects": {
-                    "total": SponsoredProject.objects.count(),
-                    "completed": SponsoredProject.objects.filter(status='COMPLETED').count(),
-                    "rejected": SponsoredProject.objects.filter(status='REJECTED').count(),
-                    "status_rows": project_status,
-                },
-                "reports": {
-                    "total": ProjectReport.objects.count(),
-                    "approved": ProjectReport.objects.filter(status='APPROVED').count(),
-                    "pending": ProjectReport.objects.exclude(status='APPROVED').count(),
-                    "status_rows": report_status,
-                },
-                "expenditures": {
-                    "total": ProjectExpenditure.objects.count(),
-                    "approved": ProjectExpenditure.objects.filter(status='APPROVED').count(),
-                    "pending": ProjectExpenditure.objects.filter(status='PENDING').count(),
-                    "status_rows": expenditure_status,
-                },
-            }
-        )
+        project_status = _status_breakdown(SponsoredProject.objects.all())
+        report_status = _status_breakdown(ProjectReport.objects.all())
+        expenditure_status = _status_breakdown(ProjectExpenditure.objects.all())
+
+        payload = {
+            "projects": {
+                "total": SponsoredProject.objects.count(),
+                "completed": SponsoredProject.objects.filter(status='COMPLETED').count(),
+                "rejected": SponsoredProject.objects.filter(status='REJECTED').count(),
+                "status_rows": project_status,
+            },
+            "reports": {
+                "total": ProjectReport.objects.count(),
+                "approved": ProjectReport.objects.filter(status='APPROVED').count(),
+                "pending": ProjectReport.objects.exclude(status='APPROVED').count(),
+                "status_rows": report_status,
+            },
+            "expenditures": {
+                "total": ProjectExpenditure.objects.count(),
+                "approved": ProjectExpenditure.objects.filter(status='APPROVED').count(),
+                "pending": ProjectExpenditure.objects.filter(status='PENDING').count(),
+                "status_rows": expenditure_status,
+            },
+        }
+        cache.set(cache_key, payload, timeout=120)
+        return Response(payload)
 
 
 # ==================== GOVERNANCE (LIGHTWEIGHT API STORE) ====================
@@ -987,7 +1328,11 @@ def _get_governance_store():
     store = cache.get("rspc_governance_store")
     if store is None:
         store = deepcopy(GOVERNANCE_DEFAULT_STORE)
-        cache.set("rspc_governance_store", store, timeout=None)
+
+    # Keep the lightweight governance workflow testable after process restarts
+    # by ensuring one minimal record exists for each interactive section.
+    _bootstrap_governance_defaults(store)
+    cache.set("rspc_governance_store", store, timeout=None)
     return store
 
 
@@ -1014,8 +1359,111 @@ def _append_audit_event(store, request, method, path, status_code=200, payload_h
     store["audit_events"].append(event)
 
 
+def _bootstrap_governance_defaults(store):
+    now_iso = timezone.now().isoformat()
+    project = SponsoredProject.objects.order_by("id").values("id", "project_number", "title").first()
+
+    if not store.get("approval_requests"):
+        store["approval_requests"].append({
+            "id": _next_governance_id(store, "approval_requests"),
+            "module_name": "RSPC",
+            "reference_id": str(project.get("id")) if project else "1",
+            "title": "Default Approval Request",
+            "description": "Auto-generated seed for workflow testing.",
+            "assigned_role": "RSPC_ADMIN",
+            "status": "PENDING",
+            "created_at": now_iso,
+            "created_by": "system",
+        })
+
+    if not store.get("recruitment_posts"):
+        store["recruitment_posts"].append({
+            "id": _next_governance_id(store, "recruitment_posts"),
+            "post_code": "RP-DEFAULT-001",
+            "project": project.get("id") if project else None,
+            "project_number": project.get("project_number") if project else None,
+            "title": "Default Research Assistant",
+            "description": "Auto-generated post for staffing workflow tests.",
+            "vacancies": 1,
+            "status": "OPEN",
+            "created_by": "system",
+            "created_at": now_iso,
+        })
+
+    if not store.get("staff_applications") and store.get("recruitment_posts"):
+        default_post = store["recruitment_posts"][0]
+        store["staff_applications"].append({
+            "id": _next_governance_id(store, "staff_applications"),
+            "post": default_post["id"],
+            "application_number": "APP-DEFAULT-001",
+            "applicant_name": "Default Candidate",
+            "email": "default.candidate@example.com",
+            "phone": "9000000000",
+            "qualification": "M.Tech",
+            "experience_years": 1,
+            "status": "SUBMITTED",
+            "remarks": "",
+            "post_title": default_post["title"],
+            "applied_at": now_iso,
+            "created_by": "system",
+            "created_at": now_iso,
+        })
+
+    # Cleanup for legacy seeded appointments that blocked appointment creation flow.
+    # Appointments should be created explicitly after admin review, not auto-bootstrapped.
+    legacy_count = len(store.get("staff_appointments", []))
+    store["staff_appointments"] = [
+        item
+        for item in store.get("staff_appointments", [])
+        if not (
+            item.get("appointment_number") == "APT-DEFAULT-001"
+            and item.get("created_by") == "system"
+        )
+    ]
+    removed_legacy = legacy_count - len(store["staff_appointments"])
+    if removed_legacy > 0:
+        store["counters"]["staff_appointments"] = max(
+            store["counters"].get("staff_appointments", 1),
+            max((item.get("id", 0) for item in store["staff_appointments"]), default=0) + 1,
+        )
+
+    if not store.get("documents"):
+        store["documents"].append({
+            "id": _next_governance_id(store, "documents"),
+            "title": "Default Compliance Document",
+            "category": "OTHER",
+            "project": str(project.get("id")) if project else None,
+            "file_url": "",
+            "checksum_sha256": get_random_string(64),
+            "history": [
+                {
+                    "at": now_iso,
+                    "event": "UPLOADED",
+                    "by": "system",
+                }
+            ],
+            "created_at": now_iso,
+        })
+
+
 class ApprovalRequestViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
+
+    _ACTION_PERMS = {
+        'list': [IsFacultyCreateOrReadOnly],
+        'create': [IsFacultyOrAdmin],
+        'check_slas': [IsRSPCAdminOnly],
+        'forward': [IsRSPCAdminOnly],
+        'approve': [IsRSPCAdminOnly],
+        'reject': [IsRSPCAdminOnly],
+        'inbox': [IsFacultyCreateOrReadOnly],
+        'project_inventory': [IsFacultyCreateOrReadOnly],
+        'project_staff': [IsFacultyCreateOrReadOnly],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
 
     def list(self, request):
         store = _get_governance_store()
@@ -1112,20 +1560,36 @@ class ApprovalRequestViewSet(viewsets.ViewSet):
 
     @action(detail=False, methods=["get"])
     def project_staff(self, request):
-        staff = []
-        for project in SponsoredProject.objects.select_related("principal_investigator")[:100]:
-            staff.append({
-                "project_id": project.id,
-                "project_number": project.project_number,
-                "pi_name": getattr(getattr(project.principal_investigator, "id", None), "user", None).username
-                if project.principal_investigator_id and project.principal_investigator and project.principal_investigator.id
-                else None,
-            })
+        rows = (
+            SponsoredProject.objects.select_related("principal_investigator__id__user")
+            .values(
+                "id",
+                "project_number",
+                "principal_investigator__id__user__username",
+            )[:100]
+        )
+        staff = [
+            {
+                "project_id": row["id"],
+                "project_number": row["project_number"],
+                "pi_name": row.get("principal_investigator__id__user__username"),
+            }
+            for row in rows
+        ]
         return Response(staff)
 
 
 class ProgressEntryViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
+
+    _ACTION_PERMS = {
+        'list': [IsFacultyCreateOrReadOnly],
+        'create': [IsFacultyOrAdmin],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
 
     def list(self, request):
         store = _get_governance_store()
@@ -1158,6 +1622,15 @@ class ProgressEntryViewSet(viewsets.ViewSet):
 
 class RecruitmentPostViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
+
+    _ACTION_PERMS = {
+        'list': [IsFacultyCreateOrReadOnly],
+        'create': [IsRSPCAdminOnly],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
 
     def _ensure_default_post(self, store, request):
         if store["recruitment_posts"]:
@@ -1212,6 +1685,17 @@ class RecruitmentPostViewSet(viewsets.ViewSet):
 class StaffApplicationViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    _ACTION_PERMS = {
+        'list': [IsFacultyCreateOrReadOnly],
+        'create': [IsFacultyOrAdmin],
+        'partial_update': [IsRSPCAdminOnly],
+        'destroy': [IsRSPCAdminOnly],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
+
     VALID_STATUSES = {
         "SUBMITTED",
         "UNDER_REVIEW",
@@ -1225,6 +1709,16 @@ class StaffApplicationViewSet(viewsets.ViewSet):
     def list(self, request):
         store = _get_governance_store()
         rows = list(store["staff_applications"])
+
+        # Faculty members should only see their own submissions,
+        # while RSPC admin/dean/director can review all applications.
+        can_review_all = RoleChecks.has_any_role(
+            request.user,
+            [RSPC_ROLE_RSPC_ADMIN, RSPC_ROLE_DEAN_RSPC, RSPC_ROLE_DIRECTOR],
+        )
+        if not can_review_all:
+            rows = [row for row in rows if row.get("created_by") == request.user.username]
+
         post_filter = request.query_params.get("post")
         status_filter = request.query_params.get("status")
 
@@ -1316,6 +1810,19 @@ class StaffApplicationViewSet(viewsets.ViewSet):
 class StaffAppointmentViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    _ACTION_PERMS = {
+        'list': [IsAdminOrAbove],
+        'create': [IsRSPCAdminOnly],
+        'destroy': [IsRSPCAdminOnly],
+        'modify_tenure': [IsRSPCAdminOnly],
+        'process_admin': [IsRSPCAdminOnly],
+        'dean_decision': [IsDeanRSPCOnly],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
+
     def list(self, request):
         store = _get_governance_store()
         return Response(store["staff_appointments"])
@@ -1336,8 +1843,23 @@ class StaffAppointmentViewSet(viewsets.ViewSet):
         if any(str(apt.get("application")) == str(application_id) for apt in store["staff_appointments"]):
             return Response({"error": "An appointment already exists for this application"}, status=400)
 
+        requested_id = request.data.get("appointment_id", request.data.get("id"))
+        if requested_id not in [None, ""]:
+            try:
+                requested_id = int(requested_id)
+            except (TypeError, ValueError):
+                return Response({"error": "appointment_id must be a positive integer"}, status=400)
+            if requested_id <= 0:
+                return Response({"error": "appointment_id must be a positive integer"}, status=400)
+            if any(int(apt.get("id", 0)) == requested_id for apt in store["staff_appointments"]):
+                return Response({"error": "appointment_id already exists"}, status=400)
+
+            appointment_id = requested_id
+        else:
+            appointment_id = _next_governance_id(store, "staff_appointments")
+
         item = {
-            "id": _next_governance_id(store, "staff_appointments"),
+            "id": appointment_id,
             "application": application_id,
             "appointment_number": request.data.get("appointment_number"),
             "employee_code": request.data.get("employee_code"),
@@ -1354,6 +1876,11 @@ class StaffAppointmentViewSet(viewsets.ViewSet):
             "created_at": timezone.now().isoformat(),
         }
         store["staff_appointments"].append(item)
+
+        store["counters"]["staff_appointments"] = max(
+            store["counters"].get("staff_appointments", 1),
+            int(appointment_id) + 1,
+        )
 
         application["status"] = "APPOINTED"
         application["updated_by"] = request.user.username
@@ -1435,6 +1962,16 @@ class StaffAppointmentViewSet(viewsets.ViewSet):
 class ClosureRequestViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    _ACTION_PERMS = {
+        'list': [IsFacultyCreateOrReadOnly],
+        'create': [IsFacultyOrAdmin],
+        'approve': [IsRSPCAdminOnly],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
+
     def list(self, request):
         store = _get_governance_store()
         return Response(store["closure_requests"])
@@ -1442,7 +1979,17 @@ class ClosureRequestViewSet(viewsets.ViewSet):
     def create(self, request):
         store = _get_governance_store()
         project_id = request.data.get("project")
-        project_number = SponsoredProject.objects.filter(id=project_id).values_list("project_number", flat=True).first()
+        project_number = (request.data.get("project_number") or "").strip()
+
+        if project_number and not project_id:
+            project_id = SponsoredProject.objects.filter(project_number__iexact=project_number).values_list("id", flat=True).first()
+
+        if project_id and not project_number:
+            project_number = SponsoredProject.objects.filter(id=project_id).values_list("project_number", flat=True).first()
+
+        if not project_id or not project_number:
+            return Response({"error": "Valid project or project_number is required"}, status=400)
+
         item = {
             "id": _next_governance_id(store, "closure_requests"),
             "project": project_id,
@@ -1461,20 +2008,42 @@ class ClosureRequestViewSet(viewsets.ViewSet):
     @action(detail=True, methods=["post"])
     def approve(self, request, pk=None):
         store = _get_governance_store()
-        for item in store["closure_requests"]:
+        for idx, item in enumerate(store["closure_requests"]):
             if item["id"] == int(pk):
-                item["status"] = "APPROVED"
-                item["approved_by"] = request.user.username
-                item["approved_at"] = timezone.now().isoformat()
+                approved_payload = {
+                    **item,
+                    "status": "APPROVED",
+                    "approved_by": request.user.username,
+                    "approved_at": timezone.now().isoformat(),
+                }
+                # Business rule: once approved, closure request should be removed
+                # from active dashboards for all roles.
+                store["closure_requests"].pop(idx)
+
+                # Remove the project itself so it no longer appears on research dashboards.
+                project_id = item.get("project")
+                if project_id:
+                    SponsoredProject.objects.filter(id=project_id).delete()
+
                 _append_audit_event(store, request, "POST", request.path)
                 _save_governance_store(store)
-                return Response(item)
+                return Response(approved_payload)
         return Response({"error": "Closure request not found"}, status=404)
 
 
 class ManagedDocumentViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
+
+    _ACTION_PERMS = {
+        'list': [IsFacultyCreateOrReadOnly],
+        'create': [IsAdminOrAbove],
+        'history': [IsFacultyCreateOrReadOnly],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
 
     def list(self, request):
         store = _get_governance_store()
@@ -1524,6 +2093,16 @@ class ManagedDocumentViewSet(viewsets.ViewSet):
 
 class RuleDefinitionViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
+
+    _ACTION_PERMS = {
+        'list': [IsAdminOrAbove],
+        'create': [IsAdminOrAbove],
+        'evaluate': [IsAdminOrAbove],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
 
     def list(self, request):
         store = _get_governance_store()
@@ -1583,6 +2162,16 @@ class RuleDefinitionViewSet(viewsets.ViewSet):
 class AutomationRuleViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    _ACTION_PERMS = {
+        'list': [IsAdminOrAbove],
+        'create': [IsAdminOrAbove],
+        'execute': [IsAdminOrAbove],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
+
     def list(self, request):
         store = _get_governance_store()
         return Response(store["automation_rules"])
@@ -1622,6 +2211,14 @@ class AutomationRuleViewSet(viewsets.ViewSet):
 class AuditEventViewSet(viewsets.ViewSet):
     permission_classes = [IsAuthenticated]
 
+    _ACTION_PERMS = {
+        'list': [IsAdminOrAbove],
+    }
+
+    def get_permissions(self):
+        perms = self._ACTION_PERMS.get(self.action)
+        return [p() for p in perms] if perms else [IsAuthenticated()]
+
     def list(self, request):
         store = _get_governance_store()
         return Response(list(reversed(store["audit_events"])))
@@ -1633,9 +2230,29 @@ class GovernanceLoginView(APIView):
     def post(self, request):
         username = request.data.get("username")
         password = request.data.get("password")
+        client_ip = request.META.get("HTTP_X_FORWARDED_FOR", request.META.get("REMOTE_ADDR", "unknown"))
+        lock_key = _login_lock_key(username, client_ip)
+        attempts_key = _login_attempt_key(username, client_ip)
+
+        if cache.get(lock_key):
+            logger.warning("Blocked login attempt due to temporary lockout", extra={"username": username, "ip": client_ip})
+            return _api_error(
+                "Too many failed login attempts. Please try again after 15 minutes.",
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "login_rate_limited",
+            )
+
         user = authenticate(request, username=username, password=password)
         if not user:
-            return Response({"error": "Invalid credentials"}, status=401)
+            attempts = int(cache.get(attempts_key, 0)) + 1
+            cache.set(attempts_key, attempts, timeout=900)
+            if attempts >= 5:
+                cache.set(lock_key, True, timeout=900)
+                logger.warning("User/IP locked due to repeated failed logins", extra={"username": username, "ip": client_ip})
+            return _api_error("Invalid credentials", status.HTTP_401_UNAUTHORIZED, "invalid_credentials")
+
+        cache.delete(attempts_key)
+        cache.delete(lock_key)
         login(request, user)
         return Response({"token": get_random_string(40), "username": user.username})
 
@@ -1654,7 +2271,80 @@ class GovernanceMeView(APIView):
     def get(self, request):
         if not request.user.is_authenticated:
             return Response({"authenticated": False, "username": None})
-        return Response({"authenticated": True, "username": request.user.username})
+        from applications.globals.models import ExtraInfo, HoldsDesignation, ModuleAccess
+
+        extra = (
+            ExtraInfo.objects.select_related('department')
+            .filter(user=request.user)
+            .first()
+        )
+        role_rows = HoldsDesignation.objects.select_related('designation').filter(working=request.user)
+        roles = list(role_rows.values_list('designation__name', flat=True))
+        selected_role = (extra.last_selected_role if extra and extra.last_selected_role else (roles[0] if roles else None))
+
+        module_access = {}
+        if selected_role:
+            access = ModuleAccess.objects.filter(designation__iexact=selected_role).first()
+            if access:
+                module_access = {
+                    "rspc": bool(access.rspc),
+                    "fts": bool(access.fts),
+                    "hr": bool(access.hr),
+                    "course_management": bool(access.course_management),
+                    "course_registration": bool(access.course_registration),
+                }
+
+        return Response(
+            {
+                "authenticated": True,
+                "username": request.user.username,
+                "name": request.user.get_full_name() or request.user.username,
+                "email": request.user.email,
+                "profile": {
+                    "extra_id": extra.id if extra else None,
+                    "user_type": extra.user_type if extra else None,
+                    "department": extra.department.name if extra and extra.department else None,
+                },
+                "roles": roles,
+                "selected_role": selected_role,
+                "module_access": module_access,
+            }
+        )
+
+
+class RSPCIntegrationContextView(APIView):
+    """Integration summary for frontend bootstrap and cross-service visibility."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        cache_key = f"rspc:integration:ctx:{request.user.pk}:v1"
+        cached_payload = cache.get(cache_key)
+        if cached_payload is not None:
+            return Response(cached_payload)
+
+        me_payload = GovernanceMeView().get(request).data
+        store = _get_governance_store()
+        pending_approvals = sum(1 for item in store["approval_requests"] if item.get("status") == "PENDING")
+        pending_closures = sum(1 for item in store["closure_requests"] if item.get("status") in {"SUBMITTED", "PENDING"})
+
+        payload = {
+            "user": me_payload,
+            "service_links": {
+                "auth_me": request.build_absolute_uri('/research_procedures/api/auth/me/'),
+                "auth_logout": request.build_absolute_uri('/research_procedures/api/auth/logout/'),
+                "projects": request.build_absolute_uri('/research_procedures/api/projects/'),
+                "approval_inbox": request.build_absolute_uri('/research_procedures/api/approval-requests/inbox/'),
+            },
+            "integration_health": {
+                "project_count": SponsoredProject.objects.count(),
+                "consultancy_count": ConsultancyProject.objects.count(),
+                "pending_approvals": pending_approvals,
+                "pending_closures": pending_closures,
+            },
+        }
+        cache.set(cache_key, payload, timeout=60)
+        return Response(payload)
 
 
 class GovernanceChangePasswordView(APIView):

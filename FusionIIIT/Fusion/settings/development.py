@@ -24,7 +24,8 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
-    )
+    ),
+    'EXCEPTION_HANDLER': 'applications.research_procedures.api.exceptions.rspc_exception_handler',
 }
 
 if DEBUG:

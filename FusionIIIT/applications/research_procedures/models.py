@@ -299,31 +299,65 @@ class SponsoredProject(models.Model):
     def __str__(self):
         return f"{self.project_number}: {self.title}" if self.project_number else f"PF No.: {self.pf_no}  pi: {self.pi}  title: {self.title}"
 
+    def _committed_expenditure_total(self):
+        return (
+            self.expenditures.exclude(status='REJECTED').aggregate(total=models.Sum('amount'))['total']
+            or Decimal('0')
+        )
+
     def clean(self):
-        allowed_designations = {"professor", "assistant professor"}
+        errors = {}
+
+        if self.sanctioned_amount is not None and self.sanctioned_amount < 0:
+            errors["sanctioned_amount"] = "Sanctioned amount cannot be negative."
+
+        if self.utilized_amount is not None and self.utilized_amount < 0:
+            errors["utilized_amount"] = "Utilized amount cannot be negative."
+
+        if (
+            self.sanctioned_amount is not None
+            and self.utilized_amount is not None
+            and self.utilized_amount > self.sanctioned_amount
+        ):
+            errors["utilized_amount"] = "Utilized amount cannot exceed sanctioned amount."
+
+        if self.pk and self.sanctioned_amount is not None:
+            committed_total = self._committed_expenditure_total()
+            if committed_total > self.sanctioned_amount:
+                errors["sanctioned_amount"] = (
+                    "Sanctioned amount cannot be reduced below committed expenditures."
+                )
+
+        if self.submission_date and self.sanction_date and self.sanction_date < self.submission_date:
+            errors["sanction_date"] = "Sanction date cannot be earlier than submission date."
+
+        if self.start_date and self.original_end_date and self.original_end_date < self.start_date:
+            errors["original_end_date"] = "Original end date must be after project start date."
+
+        if self.original_end_date and self.extended_end_date and self.extended_end_date < self.original_end_date:
+            errors["extended_end_date"] = "Extended end date must be on or after the original end date."
+
+        if self.start_date and self.actual_end_date and self.actual_end_date < self.start_date:
+            errors["actual_end_date"] = "Actual end date cannot be earlier than project start date."
 
         if self.principal_investigator_id:
-            pi_title = (self.principal_investigator.id.title or "").strip().lower()
-            if pi_title and pi_title not in allowed_designations:
-                raise ValidationError({
-                    "principal_investigator": "PI must be Professor or Assistant Professor."
-                })
             if hasattr(self.principal_investigator, 'is_permanent') and not self.principal_investigator.is_permanent:
-                raise ValidationError({
-                    "principal_investigator": "Only permanent faculty can be assigned as PI."
-                })
+                errors["principal_investigator"] = "Only permanent faculty can be assigned as PI."
 
         if self.pk and self.principal_investigator_id:
             if self.co_principal_investigators.filter(pk=self.principal_investigator_id).exists():
-                raise ValidationError({
-                    "co_principal_investigators": "PI and Co-PI cannot be the same faculty member."
-                })
+                errors["co_principal_investigators"] = "PI and Co-PI cannot be the same faculty member."
 
         if self.duration_months is not None:
             if self.duration_months < 6 or self.duration_months > 60:
-                raise ValidationError({
-                    "duration_months": "Project duration must be between 6 and 60 months."
-                })
+                errors["duration_months"] = "Project duration must be between 6 and 60 months."
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
     @property
     def is_active(self):
@@ -409,11 +443,51 @@ class ProjectExpenditure(models.Model):
         return f"{self.project.project_number} - {self.get_expenditure_head_display()} - {self.amount}"
 
     def clean(self):
+        errors = {}
         if self.amount is not None and self.amount <= 0:
-            raise ValidationError({"amount": "Expenditure amount must be positive."})
+            errors["amount"] = "Expenditure amount must be positive."
+
+        if self.project_id and self.project and self.project.status in {'COMPLETED', 'TERMINATED', 'REJECTED'}:
+            errors["project"] = "Expenditures cannot be added to closed projects."
+
+        if self.project and self.project.start_date and self.date and self.date < self.project.start_date:
+            errors["date"] = "Expenditure date cannot be earlier than project start date."
+
+        if self.last_date and self.date and self.last_date < self.date:
+            errors["last_date"] = "Expenditure last date cannot be earlier than the expenditure date."
 
         if self.last_date and self.last_date < date.today():
-            raise ValidationError({"last_date": "Expenditure last date cannot be in the past."})
+            errors["last_date"] = "Expenditure last date cannot be in the past."
+
+        if self.project and self.amount is not None:
+            committed_total = (
+                self.project.expenditures.exclude(pk=self.pk).exclude(status='REJECTED').aggregate(
+                    total=models.Sum('amount')
+                )['total'] or Decimal('0')
+            )
+            proposed_total = committed_total + self.amount
+            if self.project.sanctioned_amount and proposed_total > self.project.sanctioned_amount:
+                errors["amount"] = "Expenditure exceeds sanctioned project budget."
+
+            if self.expenditure_head == 'MANPOWER':
+                current_manpower = (
+                    self.project.expenditures.exclude(pk=self.pk).exclude(status='REJECTED').filter(
+                        expenditure_head='MANPOWER'
+                    ).aggregate(total=models.Sum('amount'))['total'] or Decimal('0')
+                )
+                manpower_cap = (self.project.sanctioned_amount or Decimal('0')) * Decimal('0.60')
+                if self.project.sanctioned_amount and current_manpower + self.amount > manpower_cap:
+                    errors["amount"] = "Manpower expenditure cannot exceed 60% of sanctioned amount."
+
+        if self.status == 'APPROVED' and not self.approved_by:
+            errors["approved_by"] = "Approved expenditures must record the approving authority."
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 class ProjectMilestone(models.Model):
@@ -468,6 +542,24 @@ class ProjectMilestone(models.Model):
             return False
         return timezone.now().date() > self.due_date
 
+    def clean(self):
+        errors = {}
+        if self.completed_date and self.completed_date < self.due_date and self.status == 'COMPLETED':
+            errors["completed_date"] = "Completion date cannot be earlier than the due date."
+
+        if self.status == 'COMPLETED' and not self.completed_date:
+            errors["completed_date"] = "Completed milestones must have a completion date."
+
+        if self.project and self.project.start_date and self.due_date and self.due_date < self.project.start_date:
+            errors["due_date"] = "Milestone due date cannot be earlier than project start date."
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
 
 class ProjectReport(models.Model):
     """Project progress reports"""
@@ -499,7 +591,7 @@ class ProjectReport(models.Model):
     achievements = models.TextField(blank=True, null=True)
     challenges = models.TextField(blank=True, null=True)
     next_steps = models.TextField(blank=True, null=True)
-    report_file = models.FileField(upload_to='rspc/projects/reports/')
+    report_file = models.FileField(upload_to='rspc/projects/reports/', blank=True, null=True)
     status = models.CharField(
         max_length=20, 
         choices=STATUS_CHOICES, 
@@ -531,16 +623,33 @@ class ProjectReport(models.Model):
             'next_steps': self.next_steps,
         }
         missing_sections = [name for name, value in required_sections.items() if not value or not str(value).strip()]
+        errors = {}
         if missing_sections:
-            raise ValidationError({'summary': f"Missing mandatory sections: {', '.join(missing_sections)}"})
+            errors['summary'] = f"Missing mandatory sections: {', '.join(missing_sections)}"
 
         if self.period_from and self.period_to:
             if self.period_to <= self.period_from:
-                raise ValidationError({'period_to': 'period_to must be after period_from.'})
+                errors['period_to'] = 'period_to must be after period_from.'
             if self.report_type == 'QUARTERLY':
                 delta_days = (self.period_to - self.period_from).days
                 if delta_days > 100:
-                    raise ValidationError({'period_to': 'Quarterly reporting window cannot exceed 100 days.'})
+                    errors['period_to'] = 'Quarterly reporting window cannot exceed 100 days.'
+
+        if self.project and self.project.start_date and self.period_from and self.period_from < self.project.start_date:
+            errors['period_from'] = 'Report period cannot start before the project start date.'
+
+        if self.status in {'SUBMITTED', 'APPROVED'} and not self.submitted_date:
+            errors['submitted_date'] = 'Submitted reports must have a submission date.'
+
+        if self.status == 'APPROVED' and not self.approved_date:
+            errors['approved_date'] = 'Approved reports must have an approval date.'
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 # ==================== CONSULTANCY ====================
@@ -551,7 +660,9 @@ class ConsultancyProject(models.Model):
     STATUS_CHOICES = [
         ('DRAFT', 'Draft'),
         ('PROPOSED', 'Proposed'),
-        ('SUBMITTED', 'Submitted for Verification'),
+        ('SUBMITTED', 'Submitted'),
+        ('VETTED_BY_HOD', 'Vetted by HoD'),
+        ('FORWARDED_TO_DIRECTOR', 'Forwarded to Director'),
         ('VERIFIED_BY_ADMIN', 'Verified by Admin'),
         ('NEGOTIATION', 'Under Negotiation'),
         ('APPROVED', 'Approved'),
@@ -686,13 +797,56 @@ class ConsultancyProject(models.Model):
         return self.contract_amount - self.payment_received
 
     def clean(self):
+        errors = {}
         if self.consultant_id and self.status in {'PROPOSED', 'SUBMITTED', 'VERIFIED_BY_ADMIN', 'APPROVED', 'ONGOING'}:
             active_count = ConsultancyProject.objects.filter(
                 consultant=self.consultant,
                 status__in={'PROPOSED', 'SUBMITTED', 'VERIFIED_BY_ADMIN', 'APPROVED', 'ONGOING'}
             ).exclude(pk=self.pk).count()
             if active_count >= 2:
-                raise ValidationError({'consultant': 'Faculty must not have more than 2 active consultancy projects.'})
+                errors['consultant'] = 'Faculty must not have more than 2 active consultancy projects.'
+
+        if self.contract_amount is not None and self.contract_amount <= 0:
+            errors['contract_amount'] = 'Contract amount must be positive.'
+
+        if self.payment_received is not None and self.payment_received < 0:
+            errors['payment_received'] = 'Payment received cannot be negative.'
+
+        if self.payment_received is not None and self.contract_amount is not None and self.payment_received > self.contract_amount:
+            errors['payment_received'] = 'Payment received cannot exceed contract amount.'
+
+        if self.start_date and self.end_date and self.end_date < self.start_date:
+            errors['end_date'] = 'End date must be after start date.'
+
+        if self.actual_completion_date and self.start_date and self.actual_completion_date < self.start_date:
+            errors['actual_completion_date'] = 'Completion date cannot be earlier than start date.'
+
+        if self.actual_completion_date and self.end_date and self.actual_completion_date < self.end_date:
+            errors['actual_completion_date'] = 'Completion date cannot be earlier than the scheduled end date.'
+
+        if self.faculty_share is not None and self.faculty_share < 0:
+            errors['faculty_share'] = 'Faculty share cannot be negative.'
+
+        if self.institute_share is not None and self.institute_share < 0:
+            errors['institute_share'] = 'Institute share cannot be negative.'
+
+        if (
+            self.faculty_share is not None
+            and self.institute_share is not None
+            and self.contract_amount is not None
+            and (self.faculty_share + self.institute_share) > self.contract_amount
+        ):
+            errors['faculty_share'] = 'Faculty share + institute share cannot exceed contract amount.'
+
+        if self.status not in {'DRAFT', 'CANCELLED'} and not self.consultant_id:
+            errors['consultant'] = 'Consultant is required once the consultancy leaves draft state.'
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 # ==================== PUBLICATIONS ====================
@@ -1067,6 +1221,24 @@ class ResearchScholar(models.Model):
     def years_enrolled(self):
         """Calculate years since enrollment"""
         return (timezone.now().date() - self.enrollment_date).days / 365.25
+
+    def clean(self):
+        errors = {}
+        if self.enrollment_date and self.expected_completion and self.expected_completion < self.enrollment_date:
+            errors['expected_completion'] = 'Expected completion must be after enrollment date.'
+
+        if self.fellowship_start_date and self.fellowship_end_date and self.fellowship_end_date < self.fellowship_start_date:
+            errors['fellowship_end_date'] = 'Fellowship end date must be after start date.'
+
+        if self.coursework_completion_date and self.enrollment_date and self.coursework_completion_date < self.enrollment_date:
+            errors['coursework_completion_date'] = 'Coursework completion cannot be before enrollment.'
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
 
 
 # ==================== TECH TRANSFER ====================

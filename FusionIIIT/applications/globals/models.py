@@ -221,6 +221,7 @@ class Faculty(models.Model):
     '''
     id = models.OneToOneField(
         ExtraInfo, on_delete=models.CASCADE, primary_key=True)
+    is_permanent = models.BooleanField(default=True)
 
         
 

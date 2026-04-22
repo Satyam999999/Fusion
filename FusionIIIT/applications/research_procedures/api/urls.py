@@ -44,11 +44,15 @@ urlpatterns = [
     # Router-generated endpoints
     path('', include(router.urls)),
 
+    # Scholar registration helpers
+    path('students/phd-options/', views.PhDStudentOptionsView.as_view(), name='api_phd_student_options'),
+
     # Governance auth endpoints
     path('auth/login/', views.GovernanceLoginView.as_view(), name='api_governance_login'),
     path('auth/logout/', views.GovernanceLogoutView.as_view(), name='api_governance_logout'),
     path('auth/me/', views.GovernanceMeView.as_view(), name='api_governance_me'),
     path('auth/change-password/', views.GovernanceChangePasswordView.as_view(), name='api_governance_change_password'),
+    path('integration/context/', views.RSPCIntegrationContextView.as_view(), name='api_rspc_integration_context'),
     
     # Statistics endpoints
     path('faculty/<int:faculty_id>/profile/', views.FacultyResearchProfileView.as_view(

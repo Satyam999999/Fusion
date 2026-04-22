@@ -33,15 +33,18 @@ def user_logged_in_middleware(get_response):
 
                 for i in designation:
                     print(i)
+                # Guard against users that do not currently hold a designation row.
+                if not designation:
+                    fallback_designation = str(getattr(user.extrainfo, 'user_type', 'staff'))
+                    designation = [fallback_designation]
 
                 request.session['currentDesignationSelected'] = designation[0]
                 request.session['allDesignations'] = designation 
                 first_designation = designation[0]
                 module_access = ModuleAccess.objects.filter(designation=first_designation).first()
+                access_rights = {}
                 
                 if module_access:
-                    access_rights = {}
-    
                     field_names = [field.name for field in ModuleAccess._meta.get_fields() if field.name not in ['id', 'designation']]
     
                     for field_name in field_names:

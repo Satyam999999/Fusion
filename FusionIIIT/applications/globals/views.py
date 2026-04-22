@@ -78,12 +78,16 @@ def index(request):
         return render(request, "globals/index1.html", context)
 
 # Reset all passwords to 'user@123' in DEV environment
+@login_required(login_url=LOGIN_URL)
 def reset_all_pass(request):
+    # Only staff users may trigger this endpoint, and only when explicitly enabled.
+    if not request.user.is_staff:
+        return HttpResponseNotFound("Not allowed")
     if settings.ALLOW_PASS_RESET:
         UserMod = get_user_model()
         arr = UserMod.objects.all()
         for e in arr:
-            print(e.username)
+            # NOTE: do NOT log or print usernames — audit via Django admin instead.
             u = User.objects.get(username=e.username)
             u.set_password('user@123')
             u.save()
@@ -784,33 +788,24 @@ def dashboard(request):
     hall_warden_user = []
     for warden in hall_wardens:
         hall_warden_user.append(warden.faculty.id.user)
-    print("modules are")
-    print(request.session.get('moduleAccessRights'))
-    context={
-        'notifications':notifs,
-        'Curr_desig' : roll_,
-        'club_details' : coordinator_club(request),
-        'designation' : designation,
+    context = {
+        'notifications': notifs,
+        'Curr_desig': roll_,
+        'club_details': coordinator_club(request),
+        'designation': designation,
         'hall_caretaker': hall_caretaker_user,
         'hall_warden': hall_warden_user,
-        
     }
-    # a=HoldsDesignation.objects.select_related('user','working','designation').filter(designation = user)
-    print(context)
-    print(type(user.extrainfo.user_type))
     if(request.user.get_username() == 'director'):
         return render(request, "dashboard/director_dashboard2.html", {})
     elif( "dean_rspc" in designation):
         return render(request, "dashboard/dashboard.html", context)
     elif user.extrainfo.user_type != "student":
-        print ("inside")
         designat = HoldsDesignation.objects.select_related().filter(user=user)
-        response = {'designat':designat}
+        response = {'designat': designat}
         context.update(response)
         return render(request, "dashboard/dashboard.html", context)
     else:
-        print ("inside2")
-        
         return render(request, "dashboard/dashboard.html", context)
 
 

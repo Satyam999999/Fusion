@@ -52,11 +52,11 @@ class SponsoredProjectService:
     """Business logic for Sponsored Projects"""
     
     @staticmethod
-    def create_project(user, title, principal_investigator, funding_agency, 
-                      sanctioned_amount, start_date, original_end_date, **kwargs) -> SponsoredProject:
-        """Create a new sponsored project with validation"""
+    def create_project(user, title, principal_investigator, funding_agency,
+                       sanctioned_amount, start_date, original_end_date, **kwargs) -> SponsoredProject:
+        """Create a new sponsored project with full model validation before persisting."""
         try:
-            project = SponsoredProject.objects.create(
+            project = SponsoredProject(
                 title=title,
                 principal_investigator=principal_investigator,
                 funding_agency=funding_agency,
@@ -67,6 +67,11 @@ class SponsoredProjectService:
                 user=user,
                 **kwargs
             )
+            # full_clean() runs all model validators before writing to DB.
+            # objects.create() does NOT call clean(); building the instance and
+            # calling save() (which itself calls full_clean() in our override) is
+            # the correct pattern.
+            project.save()
             return project
         except Exception as e:
             logger.error(f"Failed to create sponsored project '{title}': {str(e)}", exc_info=True)
@@ -74,7 +79,11 @@ class SponsoredProjectService:
     
     @staticmethod
     def update_project_status(project_id: int, new_status: str) -> SponsoredProject:
-        """Update project status with validation"""
+        """Update project status, enforcing the defined transition graph.
+        Admin-only overrides (skipping intermediate states) are intentionally
+        limited to the _ADMIN_OVERRIDE_TARGETS set and must still land on a
+        known status value.
+        """
         valid_transitions = {
             'DRAFT': ['SUBMITTED'],
             'PROPOSED': ['SUBMITTED'],
@@ -87,36 +96,48 @@ class SponsoredProjectService:
             'SANCTIONED': ['ONGOING'],
             'ONGOING': ['EXTENDED', 'COMPLETED', 'TERMINATED', 'DRAFT'],
             'EXTENDED': ['COMPLETED', 'TERMINATED'],
-            'REJECTED': ['SUBMITTED'], # resubmit
+            'REJECTED': ['SUBMITTED'],
         }
-        
-        # Additionally, any project can be forced to DRAFT by owner
-        valid_statuses = set(s for v in valid_transitions.values() for s in v).union(valid_transitions.keys())
-        
+
+        # Admin-override targets: statuses an RSPC Admin may force regardless
+        # of current state (e.g. correcting data entry errors). These must still
+        # be valid status codes and every such use should be audited in the view.
+        _ADMIN_OVERRIDE_TARGETS = {'DRAFT'}
+
+        all_valid_statuses = set(s for v in valid_transitions.values() for s in v) | set(valid_transitions)
+
         try:
             project = SponsoredProject.objects.get(id=project_id)
-            
-            if new_status != 'DRAFT' and new_status not in valid_transitions.get(project.status, []):
-                # Only fail if it's not a generic override
-                if new_status in valid_statuses:
-                    # Generic override allows to force DRAFT or jump states if needed by special admin actions
-                    pass
-                else:
+
+            allowed = valid_transitions.get(project.status, [])
+            if new_status not in allowed:
+                if new_status not in _ADMIN_OVERRIDE_TARGETS or new_status not in all_valid_statuses:
                     raise InvalidProjectStatusException(
-                        f"Cannot transition from {project.status} to {new_status}"
+                        f"Cannot transition from '{project.status}' to '{new_status}'. "
+                        f"Allowed: {allowed}"
                     )
-            
+                # else: it is an explicit admin override to a whitelisted target
+
             project.status = new_status
-            
-            # Set timestamp based on status
+
             if new_status == 'SANCTIONED':
                 project.sanction_date = timezone.now().date()
             elif new_status == 'ONGOING':
-                project.start_date = timezone.now().date()
+                project.start_date = project.start_date or timezone.now().date()
             elif new_status == 'COMPLETED':
                 project.actual_end_date = timezone.now().date()
-            
-            project.save()
+
+            update_fields = {"status": project.status}
+            if new_status == 'SANCTIONED':
+                update_fields["sanction_date"] = project.sanction_date
+            elif new_status == 'ONGOING':
+                update_fields["start_date"] = project.start_date
+            elif new_status == 'COMPLETED':
+                update_fields["actual_end_date"] = project.actual_end_date
+
+            # Do not call model save() here: legacy records can fail unrelated
+            # validations (e.g. PI title constraints) during status-only changes.
+            SponsoredProject.objects.filter(id=project.id).update(**update_fields)
             return project
         except SponsoredProject.DoesNotExist:
             raise RSPCServiceException(f"Project with id {project_id} not found")
@@ -131,7 +152,14 @@ class SponsoredProjectService:
             project.duration_months = years * 12
             if project.start_date:
                 project.extended_end_date = project.start_date + timedelta(days=(years * 365))
-            project.save()
+
+            update_fields = {"duration_months": project.duration_months}
+            if project.start_date:
+                update_fields["extended_end_date"] = project.extended_end_date
+
+            # Keep duration modification resilient for legacy projects that fail
+            # unrelated strict validations in model.save().
+            SponsoredProject.objects.filter(id=project.id).update(**update_fields)
             return project
         except SponsoredProject.DoesNotExist:
             raise RSPCServiceException(f"Project with id {project_id} not found")
@@ -208,24 +236,37 @@ class ExpenditureService:
                     f"Cannot approve expenditure with status {expenditure.status}"
                 )
 
+            from applications.globals.models import ExtraInfo
+            approver_info = ExtraInfo.objects.filter(user=approved_by_user).first()
+            if not approver_info:
+                raise ExpenditureApprovalException(
+                    "Approver profile not found. Please ensure user has ExtraInfo mapping."
+                )
+
             expenditure.status = 'APPROVED'
-            expenditure.approved_by = approved_by_user
+            expenditure.approved_by = approver_info
             expenditure.approval_date = timezone.now().date()
             expenditure.save()
 
             # Atomically recalculate and persist the project's utilized_amount
             project = SponsoredProject.objects.select_for_update().get(pk=expenditure.project_id)
-            project.utilized_amount = (
+            utilized_amount = (
                 ProjectExpenditure.objects.filter(
                     project=project, status='APPROVED'
                 ).aggregate(total=models.Sum('amount'))['total'] or Decimal('0')
             )
-            project.save(update_fields=['utilized_amount', 'updated_at'])
+            SponsoredProject.objects.filter(pk=project.pk).update(
+                utilized_amount=utilized_amount,
+                updated_at=timezone.now(),
+            )
 
             return expenditure
         except ProjectExpenditure.DoesNotExist:
             logger.error(f"Cannot approve expenditure {expenditure_id}: Not found")
             raise ExpenditureApprovalException(f"Expenditure with id {expenditure_id} not found")
+        except Exception as e:
+            logger.exception("Failed to approve expenditure", extra={"expenditure_id": expenditure_id})
+            raise ExpenditureApprovalException(str(e))
     
     @staticmethod
     @transaction.atomic
@@ -324,17 +365,25 @@ class ResearchScholarService:
     @staticmethod
     def update_progress_status(scholar_id: int, new_status: str) -> ResearchScholar:
         """Update scholar progress status"""
-        valid_statuses = [
-            'REGISTERED', 'COURSEWORK', 'COMPREHENSIVE_EXAM', 'SYNOPSIS',
-            'THESIS_WRITING', 'THESIS_SUBMISSION', 'DEFENSE', 'COMPLETED'
-        ]
+        # Keep service-level validation in sync with model enum values.
+        valid_statuses = {
+            key for key, _ in ResearchScholar.PROGRESS_STATUS_CHOICES
+        }
+
+        # Backward compatibility for legacy UI/status strings.
+        legacy_aliases = {
+            'SYNOPSIS': 'SYNOPSIS_PHASE',
+            'THESIS_SUBMISSION': 'DEFENSE_READY',
+            'DEFENSE': 'DEFENDED',
+        }
+        normalized_status = legacy_aliases.get(new_status, new_status)
         
-        if new_status not in valid_statuses:
+        if normalized_status not in valid_statuses:
             raise ValidationError(f"Invalid progress status: {new_status}")
         
         try:
             scholar = ResearchScholar.objects.get(id=scholar_id)
-            scholar.progress_status = new_status
+            scholar.progress_status = normalized_status
             scholar.save()
             return scholar
         except ResearchScholar.DoesNotExist:

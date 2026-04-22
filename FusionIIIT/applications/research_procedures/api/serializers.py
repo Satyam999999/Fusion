@@ -7,37 +7,14 @@ from decimal import Decimal
 
 from rest_framework import serializers
 from django.db.models import Sum
-from datetime import datetime, date
+from datetime import date
 from ..models import (
     ResearchGroup, ResearchArea, FundingAgency, SponsoredProject,
     ProjectExpenditure, ProjectMilestone, ProjectReport,
     ConsultancyProject, Publication, Patent, ResearchScholar,
     TechTransfer, ResearchProject
 )
-
-
-def normalize_flexible_date(value):
-    if isinstance(value, date):
-        return value
-    if not isinstance(value, str):
-        return value
-
-    normalized = value.strip().replace('Sept.', 'Sep').replace('Sept', 'Sep')
-    formats = [
-        '%Y-%m-%d',
-        '%d-%m-%Y',
-        '%d/%m/%Y',
-        '%d %b %Y',
-        '%d %B %Y',
-        '%b %d, %Y',
-        '%B %d, %Y',
-    ]
-    for fmt in formats:
-        try:
-            return datetime.strptime(normalized, fmt).date()
-        except ValueError:
-            continue
-    return value
+from .validation_utils import add_date_order_error, normalize_flexible_date, parse_date_fields
 
 
 # ==================== NESTED SERIALIZERS ====================
@@ -56,9 +33,16 @@ class ProjectExpenditureSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         instance = getattr(self, 'instance', None)
         project = attrs.get('project') or (instance.project if instance else None)
+        expenditure_date = attrs.get('date') or (instance.date if instance else None)
 
         if attrs.get('amount') is not None and attrs['amount'] <= 0:
             raise serializers.ValidationError({'amount': 'Expenditure amount must be positive.'})
+
+        if project and project.status in {'COMPLETED', 'TERMINATED', 'REJECTED'}:
+            raise serializers.ValidationError({'project': 'Expenditures cannot be added to closed projects.'})
+
+        if project and project.start_date and expenditure_date and expenditure_date < project.start_date:
+            raise serializers.ValidationError({'date': 'Expenditure date cannot be earlier than project start date.'})
 
         last_date_value = attrs.get('last_date')
         if isinstance(last_date_value, str):
@@ -205,9 +189,9 @@ class SponsoredProjectDetailSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     is_active = serializers.BooleanField(read_only=True)
     budget_utilization_percent = serializers.SerializerMethodField()
-    expenditures = ProjectExpenditureSerializer(source='projectexpenditure_set', many=True, read_only=True)
-    milestones = ProjectMilestoneSerializer(source='projectmilestone_set', many=True, read_only=True)
-    reports = ProjectReportSerializer(source='projectreport_set', many=True, read_only=True)
+    expenditures = ProjectExpenditureSerializer(many=True, read_only=True)
+    milestones = ProjectMilestoneSerializer(many=True, read_only=True)
+    reports = ProjectReportSerializer(many=True, read_only=True)
 
     class Meta:
         model = SponsoredProject
@@ -234,34 +218,78 @@ class SponsoredProjectCreateUpdateSerializer(serializers.ModelSerializer):
                  'proposal_document', 'sanction_letter', 'completion_report', 'notes', 'research_scholars']
 
     def validate(self, attrs):
-        date_fields = [
+        parse_date_fields(attrs, [
             'submission_date',
             'sanction_date',
             'start_date',
             'original_end_date',
             'extended_end_date',
             'actual_end_date',
-        ]
+        ])
 
-        for field_name in date_fields:
-            value = attrs.get(field_name)
-            if isinstance(value, str):
-                parsed = normalize_flexible_date(value)
-                if isinstance(parsed, str):
-                    raise serializers.ValidationError({field_name: 'Unsupported date format.'})
-                attrs[field_name] = parsed
+        submission_date = attrs.get('submission_date')
+        sanction_date = attrs.get('sanction_date')
+        start_date = attrs.get('start_date')
+        original_end_date = attrs.get('original_end_date')
+        extended_end_date = attrs.get('extended_end_date')
+        actual_end_date = attrs.get('actual_end_date')
+        sanctioned_amount = attrs.get('sanctioned_amount')
+        utilized_amount = attrs.get('utilized_amount')
+        errors = {}
+
+        if (
+            sanctioned_amount is not None
+            and utilized_amount is not None
+            and utilized_amount > sanctioned_amount
+        ):
+            errors['utilized_amount'] = 'Utilized amount cannot exceed sanctioned amount.'
+
+        add_date_order_error(
+            errors,
+            submission_date,
+            sanction_date,
+            'sanction_date',
+            'Sanction date cannot be earlier than submission date.',
+        )
+        add_date_order_error(
+            errors,
+            start_date,
+            original_end_date,
+            'original_end_date',
+            'Original end date must be after project start date.',
+        )
+        add_date_order_error(
+            errors,
+            original_end_date,
+            extended_end_date,
+            'extended_end_date',
+            'Extended end date must be on or after the original end date.',
+        )
+        add_date_order_error(
+            errors,
+            start_date,
+            actual_end_date,
+            'actual_end_date',
+            'Actual end date cannot be earlier than project start date.',
+        )
 
         pi = attrs.get('principal_investigator')
         copi_list = attrs.get('co_principal_investigators', [])
         if pi and pi in copi_list:
-            raise serializers.ValidationError({'co_principal_investigators': 'PI and Co-PI cannot be the same.'})
+            errors['co_principal_investigators'] = 'PI and Co-PI cannot be the same.'
+
+        research_scholars = attrs.get('research_scholars') or []
+        if research_scholars:
+            scholar_ids = [getattr(scholar, 'pk', scholar) for scholar in research_scholars]
+            if len(scholar_ids) != len(set(scholar_ids)):
+                errors['research_scholars'] = 'Duplicate research scholars are not allowed.'
 
         if pi:
-            pi_title = (pi.id.title or '').strip().lower()
-            if pi_title and pi_title not in {'professor', 'assistant professor'}:
-                raise serializers.ValidationError({
-                    'principal_investigator': 'PI must be Professor or Assistant Professor.'
-                })
+            if hasattr(pi, 'is_permanent') and not pi.is_permanent:
+                errors['principal_investigator'] = 'Only permanent faculty can be assigned as PI.'
+
+        if errors:
+            raise serializers.ValidationError(errors)
 
         return attrs
 
@@ -311,9 +339,20 @@ class ConsultancyProjectCreateUpdateSerializer(serializers.ModelSerializer):
                  'agreement_document', 'completion_certificate', 'remarks', 'notes']
 
     def validate(self, attrs):
+        parse_date_fields(attrs, [
+            'start_date',
+            'end_date',
+            'actual_completion_date',
+        ])
+
         contract_amount = attrs.get('contract_amount')
         faculty_share = attrs.get('faculty_share')
         institute_share = attrs.get('institute_share')
+        start_date = attrs.get('start_date')
+        end_date = attrs.get('end_date')
+        actual_completion_date = attrs.get('actual_completion_date')
+        payment_received = attrs.get('payment_received')
+        errors = {}
 
         # BR-RSPC-020: Faculty members MUST NOT have more than 2 active consultancy projects.
         consultant = attrs.get('consultant')
@@ -326,28 +365,53 @@ class ConsultancyProjectCreateUpdateSerializer(serializers.ModelSerializer):
                 status__in={'PROPOSED', 'SUBMITTED', 'VERIFIED_BY_ADMIN', 'APPROVED', 'ONGOING'}
             ).exclude(pk=instance_id).count()
             if active_count >= 2:
-                raise serializers.ValidationError({'consultant': 'BR-RSPC-020: Faculty must not have more than 2 active consultancy projects.'})
+                errors['consultant'] = 'BR-RSPC-020: Faculty must not have more than 2 active consultancy projects.'
+
+        add_date_order_error(
+            errors,
+            start_date,
+            end_date,
+            'end_date',
+            'End date must be after start date.',
+        )
+        add_date_order_error(
+            errors,
+            start_date,
+            actual_completion_date,
+            'actual_completion_date',
+            'Completion date cannot be earlier than start date.',
+        )
+        add_date_order_error(
+            errors,
+            end_date,
+            actual_completion_date,
+            'actual_completion_date',
+            'Completion date cannot be earlier than scheduled end date.',
+        )
 
         if contract_amount is not None and contract_amount <= 0:
-            raise serializers.ValidationError({'contract_amount': 'Contract amount must be positive.'})
+            errors['contract_amount'] = 'Contract amount must be positive.'
+
+        if payment_received is not None and payment_received < 0:
+            errors['payment_received'] = 'Payment received cannot be negative.'
+
+        if contract_amount is not None and payment_received is not None and payment_received > contract_amount:
+            errors['payment_received'] = 'Payment received cannot exceed contract amount.'
 
         if contract_amount is not None and contract_amount < Decimal('50000'):
-            raise serializers.ValidationError({
-                'contract_amount': 'Minimum consultancy contract amount is 50,000.'
-            })
+            errors['contract_amount'] = 'Minimum consultancy contract amount is 50,000.'
 
         if contract_amount is not None and institute_share is not None:
             min_institute_share = contract_amount * Decimal('0.30')
             if institute_share < min_institute_share:
-                raise serializers.ValidationError({
-                    'institute_share': 'Institute overhead share must be at least 30% of contract amount.'
-                })
+                errors['institute_share'] = 'Institute overhead share must be at least 30% of contract amount.'
 
         if faculty_share is not None and institute_share is not None and contract_amount is not None:
             if (faculty_share + institute_share) > contract_amount:
-                raise serializers.ValidationError({
-                    'faculty_share': 'Faculty share + institute share cannot exceed contract amount.'
-                })
+                errors['faculty_share'] = 'Faculty share + institute share cannot exceed contract amount.'
+
+        if errors:
+            raise serializers.ValidationError(errors)
 
         return attrs
 
