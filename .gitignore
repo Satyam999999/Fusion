@@ -87,3 +87,26 @@ venv*/
 reqs_filtered.txt
 *_filtered.txt
 FusionIIIT/rspc_seed_data.py
+
+# Database backups and seed files
+db_backups/
+*.sql
+*.sql.backup
+*.sqlite3
+seed_data/
+test_data/
+dump.rdb
+
+# Temporary and generated files
+*.tmp
+*.temp
+*.cache
+*.log
+uploads/
+
+# OS and system files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
